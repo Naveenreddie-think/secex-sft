@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SecEx Review Tool</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css">
+<style>
+  body { font-family: ui-sans-serif, system-ui, sans-serif; }
+  textarea { font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body class="bg-gray-100 min-h-screen p-6">
+
+<div class="max-w-5xl mx-auto">
+  <div class="flex justify-between items-center mb-4">
+    <h1 class="text-xl font-bold text-gray-800">SecEx-SFT — Label Review</h1>
+    <div id="progress" class="text-sm text-gray-600">Loading...</div>
+  </div>
+
+  <div id="empty-state" class="hidden bg-green-50 border border-green-300 rounded p-6 text-center text-green-800">
+    All items reviewed. Nice work.
+  </div>
+
+  <div id="review-panel" class="grid grid-cols-2 gap-4">
+    <!-- Original text -->
+    <div class="bg-white rounded shadow p-4">
+      <h2 class="font-semibold text-gray-700 mb-2">Original Advisory Text</h2>
+      <div id="source-id" class="text-xs text-gray-500 mb-2"></div>
+      <pre id="input-text" class="whitespace-pre-wrap text-sm text-gray-800 max-h-[70vh] overflow-y-auto"></pre>
+    </div>
+
+    <!-- Editable label -->
+    <div class="bg-white rounded shadow p-4">
+      <h2 class="font-semibold text-gray-700 mb-2">Verified Label</h2>
+      <form id="review-form" class="space-y-3">
+
+        <div>
+          <label class="text-xs font-medium text-gray-600">CVE ID</label>
+          <input id="cve_id" class="w-full border rounded px-2 py-1 text-sm" />
+        </div>
+
+        <div>
+          <label class="text-xs font-medium text-gray-600">CWE Category</label>
+          <input id="cwe_category" class="w-full border rounded px-2 py-1 text-sm" />
+        </div>
+
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-xs font-medium text-gray-600">Severity</label>
+            <select id="severity" class="w-full border rounded px-2 py-1 text-sm">
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="critical">critical</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-medium text-gray-600">Attack Vector</label>
+            <select id="attack_vector" class="w-full border rounded px-2 py-1 text-sm">
+              <option value="network">network</option>
+              <option value="adjacent">adjacent</option>
+              <option value="local">local</option>
+              <option value="physical">physical</option>
+              <option value="unknown">unknown</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label class="text-xs font-medium text-gray-600">Impact Summary (max 400 chars)</label>
+          <textarea id="impact_summary" rows="3" maxlength="400" class="w-full border rounded px-2 py-1 text-sm"></textarea>
+        </div>
+
+        <div>
+          <label class="text-xs font-medium text-gray-600">Remediation Action</label>
+          <textarea id="remediation_action" rows="2" class="w-full border rounded px-2 py-1 text-sm"></textarea>
+        </div>
+
+        <div>
+          <label class="text-xs font-medium text-gray-600">Affected Products (JSON array)</label>
+          <textarea id="affected_products" rows="4" class="w-full border rounded px-2 py-1 text-xs"></textarea>
+        </div>
+
+        <div id="error-box" class="hidden text-red-600 text-sm"></div>
+
+        <button type="submit" class="w-full bg-blue-600 text-white rounded py-2 font-medium hover:bg-blue-700">
+          Save &amp; Next
+        </button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = "http://localhost:8000";
+let currentItemId = null;
+
+async function loadStats() {
+  const res = await fetch(`${API_BASE}/review/stats`);
+  const stats = await res.json();
+  document.getElementById("progress").textContent =
+    `${stats.verified} / ${stats.total} reviewed (${stats.remaining} remaining)`;
+  return stats;
+}
+
+async function loadNext() {
+  const stats = await loadStats();
+  if (stats.remaining === 0) {
+    document.getElementById("review-panel").classList.add("hidden");
+    document.getElementById("empty-state").classList.remove("hidden");
+    return;
+  }
+
+  const res = await fetch(`${API_BASE}/review/next`);
+  const item = await res.json();
+  if (!item) {
+    document.getElementById("review-panel").classList.add("hidden");
+    document.getElementById("empty-state").classList.remove("hidden");
+    return;
+  }
+
+  currentItemId = item.id;
+  document.getElementById("source-id").textContent = item.source_ghsa_id;
+  document.getElementById("input-text").textContent = item.input_text;
+
+  const label = item.auto_label.vulnerabilities[0];
+  document.getElementById("cve_id").value = label.cve_id || "";
+  document.getElementById("cwe_category").value = label.cwe_category || "";
+  document.getElementById("severity").value = label.severity;
+  document.getElementById("attack_vector").value = label.attack_vector;
+  document.getElementById("impact_summary").value = label.impact_summary || "";
+  document.getElementById("remediation_action").value = label.remediation_action || "";
+  document.getElementById("affected_products").value = JSON.stringify(label.affected_products, null, 2);
+
+  document.getElementById("error-box").classList.add("hidden");
+}
+
+document.getElementById("review-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const errorBox = document.getElementById("error-box");
+  errorBox.classList.add("hidden");
+
+  let affectedProducts;
+  try {
+    affectedProducts = JSON.parse(document.getElementById("affected_products").value);
+  } catch (err) {
+    errorBox.textContent = "Affected Products must be valid JSON.";
+    errorBox.classList.remove("hidden");
+    return;
+  }
+
+  const payload = {
+    verified_label: {
+      vulnerabilities: [
+        {
+          cve_id: document.getElementById("cve_id").value || null,
+          affected_products: affectedProducts,
+          cwe_category: document.getElementById("cwe_category").value || null,
+          severity: document.getElementById("severity").value,
+          attack_vector: document.getElementById("attack_vector").value,
+          impact_summary: document.getElementById("impact_summary").value,
+          remediation_action: document.getElementById("remediation_action").value || null,
+        }
+      ]
+    }
+  };
+
+  const res = await fetch(`${API_BASE}/review/${currentItemId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    errorBox.textContent = `Save failed: ${body}`;
+    errorBox.classList.remove("hidden");
+    return;
+  }
+
+  await loadNext();
+});
+
+loadNext();
+</script>
+</body>
+</html>
