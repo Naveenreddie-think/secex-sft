@@ -46,3 +46,39 @@
 
 \- GHSA organizes advisories by package ecosystem (`GO`, `NPM`, `PIP`, etc.), not by CPE-style vendor/product convention used by NVD. The `vendor` field in this dataset reflects ecosystem, not an actual maintainer/vendor name — a known simplification stemming from the data source, not an extraction error.
 
+
+
+\## Baseline Evaluation (Prompting-Only, Unmodified Qwen2.5-3B-Instruct)
+
+
+
+One-shot prompting, temperature=0 for reproducibility, evaluated with a shared harness against both an in-distribution test set and a fully out-of-distribution test set (entire "Uncontrolled Resource Consumption" CWE category held out from training/dev entirely).
+
+
+
+| Metric | ID test (n=19) | OOD test (n=16) |
+
+|---|---|---|
+
+| Schema-valid rate | 89.5% | 75.0% |
+
+| Severity accuracy | 35.3% | 75.0% |
+
+| Attack vector accuracy | 58.8% | 50.0% |
+
+| CWE category (fuzzy match, threshold 0.5) | 23.5% | 16.7% |
+
+| CVE ID exact match | 47.1% | 33.3% |
+
+
+
+\*\*Notable failure mode\*\*: the dominant cause of schema-invalid output was the base model producing `attack\_vector: "remote"` instead of the schema's required `"network"` enum value — a vocabulary mismatch (CVSS/common-parlance terminology vs. the project's exact schema), not a conceptual extraction error. This is expected to be one of the more directly fixable gaps via fine-tuning, since SFT should teach the model the exact schema vocabulary.
+
+
+
+\*\*Eval harness bug caught and fixed during this step\*\*: an early version of the scoring harness compared Python `Enum` members using `str()`, which returns `"ClassName.member\_name"` rather than the actual string value for a custom `(str, Enum)` mixin — this silently zeroed out `severity` and `attack\_vector` accuracy entirely before being caught and fixed (`.value` used explicitly instead). Worth noting as a reminder that eval harness correctness needs the same scrutiny as model behavior — a scoring bug can otherwise silently invalidate every downstream comparison, including making a fine-tuned model look artificially better if its outputs happen not to trigger the same bug.
+
+
+
+\*\*Interpretation caution\*\*: severity accuracy is counterintuitively higher on the OOD set (75% vs 35.3% ID) — this is noted rather than explained, given the small OOD sample size (16 items); it should not be treated as a proven mechanism without further investigation once more data/results are available.
+

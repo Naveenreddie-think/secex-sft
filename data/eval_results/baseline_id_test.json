@@ -1,0 +1,20 @@
+{
+  "total_items": 19,
+  "schema_valid_rate": 0.8947368421052632,
+  "field_accuracy": {
+    "severity": 0.35294117647058826,
+    "attack_vector": 0.5882352941176471,
+    "cwe_category": 0.23529411764705882,
+    "cve_id": 0.47058823529411764
+  },
+  "parse_errors": [
+    {
+      "id": "GHSA-3wp3-xxj9-5jqq",
+      "error": "ValidationError: 1 validation error for ExtractionResult\nvulnerabilities.0.attack_vector\n  Input should be 'network', 'adjacent', 'local', 'physical' or 'unknown' [type=enum, input_value='remote', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.9/v/enum"
+    },
+    {
+      "id": "GHSA-mv8w-475r-vwqw",
+      "error": "ValidationError: 1 validation error for ExtractionResult\nvulnerabilities.0.attack_vector\n  Input should be 'network', 'adjacent', 'local', 'physical' or 'unknown' [type=enum, input_value='remote', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.9/v/enum"
+    }
+  ]
+}
