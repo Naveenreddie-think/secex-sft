@@ -1,0 +1,11 @@
+{
+  "total_items": 16,
+  "schema_valid_rate": 1.0,
+  "field_accuracy": {
+    "severity": 0.5,
+    "attack_vector": 0.6875,
+    "cwe_category": 0.0,
+    "cve_id": 0.3125
+  },
+  "parse_errors": []
+}

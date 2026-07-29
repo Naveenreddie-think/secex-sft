@@ -5,3 +5,4 @@ __pycache__/
 data/raw/
 .pytest_cache/
 unsloth_compiled_cache/
+checkpoints/

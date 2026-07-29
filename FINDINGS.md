@@ -82,3 +82,26 @@ One-shot prompting, temperature=0 for reproducibility, evaluated with a shared h
 
 \*\*Interpretation caution\*\*: severity accuracy is counterintuitively higher on the OOD set (75% vs 35.3% ID) — this is noted rather than explained, given the small OOD sample size (16 items); it should not be treated as a proven mechanism without further investigation once more data/results are available.
 
+## QLoRA Fine-Tuning Results: The Core Finding
+
+Trained via Unsloth (LoRA rank=16, alpha=16, 4-bit base, targeting all attention + MLP projection layers) on Qwen2.5-3B-Instruct, 146 training examples, 3 epochs. Train loss: 2.2 → 1.47 average. Eval loss: 1.428 → 1.369 → 1.360 across epochs (still decreasing at epoch 3, no overfitting signature observed within this budget).
+
+| Metric | Baseline ID | Fine-tuned ID | Baseline OOD | Fine-tuned OOD |
+|---|---|---|---|---|
+| Schema-valid rate | 89.5% | 100% | 75.0% | 100% |
+| Severity accuracy | 35.3% | 36.8% | 75.0% | 50.0% |
+| Attack vector accuracy | 58.8% | 63.2% | 50.0% | 68.8% |
+| CWE category (fuzzy match) | 23.5% | 47.4% | 16.7% | **0.0%** |
+| CVE ID exact match | 47.1% | 42.1% | 33.3% | 31.3% |
+
+**Clean win — schema compliance**: fine-tuning eliminated 100% of the enum-vocabulary mismatch failures (`"remote"` vs `"network"`) that caused ~10-25% of baseline outputs to fail schema validation. Both test sets hit 100% schema-valid post-SFT.
+
+**Clean win — in-distribution CWE categorization**: fuzzy-match CWE accuracy nearly doubled on the in-distribution test set (23.5% → 47.4%), suggesting the model learned the project's specific CWE-naming conventions well for categories it saw during training.
+
+**Critical negative finding — CWE categorization does not generalize to a novel category**: on the out-of-distribution test set (an entire CWE category, "Uncontrolled Resource Consumption," held out from training), CWE accuracy dropped from 16.7% (baseline) to **0%** (fine-tuned). This is the most important result in this project. The likely mechanism, offered as a hypothesis rather than a proven fact: fine-tuning on many in-distribution categories taught the model a confident, specific mapping from vulnerability-description patterns to known category names, but this specialization did not transfer to a genuinely unseen category — if anything, the model's increased confidence in learned patterns actively hurt its ability to produce a correct answer for something outside that learned distribution, where the untrained base model's more general (if fuzzier) knowledge occasionally succeeded by chance.
+
+**Secondary regression — severity accuracy also dropped on OOD** (75% → 50%), consistent with the same generalization gap, though the small OOD sample size (n=16) means this shouldn't be over-interpreted in isolation.
+
+**CVE ID accuracy declined slightly on both splits** (47.1%→42.1% ID, 33.3%→31.3% OOD). Given only 10% of the original 200 examples had a real CVE ID, the training data's heavy `null` class imbalance is a plausible cause — the model may have learned to default toward `null` more confidently post-SFT. Not deeply investigated further given time constraints; flagged as an open question rather than a resolved explanation.
+
+**Overall interpretation**: QLoRA fine-tuning on this small (146-example) dataset delivered a genuine, substantial improvement on tasks close to the training distribution — perfect schema compliance and much better in-distribution CWE categorization — but did not deliver, and may have actively hurt, generalization to a genuinely novel vulnerability category. This is a realistic and honest picture of what small-scale QLoRA fine-tuning can and cannot do, and is arguably a more useful result for demonstrating real engineering judgment than a uniformly positive outcome would have been.
