@@ -118,3 +118,15 @@ Tested two mitigation layers against the underspecified-input hallucination desc
 2. **Code-level groundedness check**, implemented as a post-processing step that verifies any specific `cve_id` or `affected_products.product` value literally appears (normalized) in the source text before allowing it through; ungrounded values are nulled/dropped rather than trusted. Result: **effective** — correctly caught and removed both fabricated values in testing.
 
 This is a concrete example of a broader, important lesson: prompt-level instructions are not a reliable safety mechanism for output correctness in a small fine-tuned model. A verifiable, code-level check against the actual source text is required wherever hallucination risk matters — the model's own stated intent ("I won't invent things") cannot be trusted at face value.
+
+## Groundedness Check Extended to version_range
+
+Live testing with a fresh, out-of-training advisory (Discourse Subscriptions authorization bypass) surfaced a gap in the original groundedness check: it verified `cve_id` and `affected_products.product` but not `version_range`. The model fabricated a specific version number ("<= 4.1.0") that did not appear anywhere in the source text, which the original check let through since it only validated product name and CVE ID. Extended the check to validate `version_range` against the source text as well; confirmed the fix correctly nulls fabricated version numbers on retest while leaving genuinely-stated details (CVE ID, product name) untouched.
+
+This is a useful illustration of hallucination as a per-field problem, not a per-extraction problem — a model can be correctly grounded on some fields of an output and fabricate others in the same response, so groundedness verification needs to cover every field capable of carrying a specific, checkable claim, not just the most obviously risky one.
+
+## Groundedness Gap: Fabricated Entities Leaking Into Free-Text Fields
+
+Live testing surfaced a real gap in the groundedness check: it validated cve_id, product name, and version_range as structured fields, but did not check whether the same fabricated entity also appeared in the free-text impact_summary or remediation_action fields. In one case, the model fabricated a product name ("@microsoft/fast-api-authentication"), which was correctly caught and dropped from affected_products — but the same fabricated name still appeared, unflagged, in the remediation_action text. This meant the UI displayed a "details removed" notice while simultaneously showing that same unverified detail elsewhere on the page, which is arguably worse than no check at all since it implies the output was fully cleaned when it wasn't.
+
+Fixed by scanning free-text fields for any entity already identified as ungrounded from the structured-field check, and surfacing a warning if found. Chose to flag rather than auto-strip the substring from prose, since removing a mid-sentence phrase programmatically often produces broken grammar — transparency about the remaining issue was judged preferable to a silent, potentially malformed edit.

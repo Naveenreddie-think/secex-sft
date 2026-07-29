@@ -22,33 +22,54 @@ def _appears_in_source(value: str | None, source_text: str) -> bool:
 
 
 def check_groundedness(extraction: dict, source_text: str) -> tuple[dict, list[str]]:
-    """
-    Checks each vulnerability entry's specific claims against the source text.
-    Returns a (possibly modified) extraction dict and a list of warning strings.
-    Ungrounded cve_id and affected_products entries are nulled/dropped.
-    """
     warnings = []
     vulns = extraction.get("vulnerabilities", [])
 
     for i, vuln in enumerate(vulns):
+        ungrounded_entities = []
+
         cve_id = vuln.get("cve_id")
         if cve_id and not _appears_in_source(cve_id, source_text):
             warnings.append(
                 f"vulnerabilities[{i}].cve_id ('{cve_id}') not found in source text — nulled out"
             )
+            ungrounded_entities.append(cve_id)
             vuln["cve_id"] = None
 
         grounded_products = []
         for product in vuln.get("affected_products", []):
             product_name = product.get("product", "")
-            if _appears_in_source(product_name, source_text):
-                grounded_products.append(product)
-            else:
+            if not _appears_in_source(product_name, source_text):
                 warnings.append(
                     f"vulnerabilities[{i}].affected_products entry ('{product_name}') "
                     f"not found in source text — dropped"
                 )
+                ungrounded_entities.append(product_name)
+                continue
+
+            version_range = product.get("version_range")
+            if version_range and not _appears_in_source(version_range, source_text):
+                warnings.append(
+                    f"vulnerabilities[{i}].affected_products['{product_name}'].version_range "
+                    f"('{version_range}') not found in source text — nulled out"
+                )
+                ungrounded_entities.append(version_range)
+                product["version_range"] = None
+
+            grounded_products.append(product)
 
         vuln["affected_products"] = grounded_products
+
+        # Check free-text fields for leakage of the same ungrounded entities
+        for field_name in ("impact_summary", "remediation_action"):
+            field_value = vuln.get(field_name)
+            if not field_value:
+                continue
+            for entity in ungrounded_entities:
+                if entity and entity.lower() in field_value.lower():
+                    warnings.append(
+                        f"vulnerabilities[{i}].{field_name} still references the "
+                        f"unverified value '{entity}' — flagged, not auto-edited"
+                    )
 
     return extraction, warnings
