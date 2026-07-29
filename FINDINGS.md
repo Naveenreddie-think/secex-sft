@@ -105,3 +105,16 @@ Trained via Unsloth (LoRA rank=16, alpha=16, 4-bit base, targeting all attention
 **CVE ID accuracy declined slightly on both splits** (47.1%→42.1% ID, 33.3%→31.3% OOD). Given only 10% of the original 200 examples had a real CVE ID, the training data's heavy `null` class imbalance is a plausible cause — the model may have learned to default toward `null` more confidently post-SFT. Not deeply investigated further given time constraints; flagged as an open question rather than a resolved explanation.
 
 **Overall interpretation**: QLoRA fine-tuning on this small (146-example) dataset delivered a genuine, substantial improvement on tasks close to the training distribution — perfect schema compliance and much better in-distribution CWE categorization — but did not deliver, and may have actively hurt, generalization to a genuinely novel vulnerability category. This is a realistic and honest picture of what small-scale QLoRA fine-tuning can and cannot do, and is arguably a more useful result for demonstrating real engineering judgment than a uniformly positive outcome would have been.
+
+## Serving-Time Observation: Hallucination on Underspecified Input
+
+When tested with a synthetic advisory that deliberately omitted any specific CVE ID, vendor, or product name, the merged fine-tuned model still produced a fully populated, plausible-looking `affected_products` entry and a fabricated CVE ID rather than returning `null`/empty for the missing fields. This did not surface during formal evaluation because every real GHSA advisory in the dataset contains an explicit package/product reference, so the model was never trained on genuinely ambiguous input. This is a known, documented limitation of the current model: it is not guaranteed to abstain when identifying details are absent from the source text, and outputs should not be treated as grounded by default when tested on inputs unlike the training distribution.
+
+## Hallucination Mitigation: Prompting Alone Was Insufficient
+
+Tested two mitigation layers against the underspecified-input hallucination described above:
+
+1. **Stronger system prompt** explicitly instructing the model never to invent CVE IDs, vendor names, or product names not literally present in the source text. Result: **ineffective** — the model still fabricated a plausible-looking CVE ID and package name on the same test case, just with different specific (wrong) values than before.
+2. **Code-level groundedness check**, implemented as a post-processing step that verifies any specific `cve_id` or `affected_products.product` value literally appears (normalized) in the source text before allowing it through; ungrounded values are nulled/dropped rather than trusted. Result: **effective** — correctly caught and removed both fabricated values in testing.
+
+This is a concrete example of a broader, important lesson: prompt-level instructions are not a reliable safety mechanism for output correctness in a small fine-tuned model. A verifiable, code-level check against the actual source text is required wherever hallucination risk matters — the model's own stated intent ("I won't invent things") cannot be trusted at face value.

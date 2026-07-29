@@ -1,0 +1,6 @@
+SYSTEM_INSTRUCTION = """Extract structured vulnerability information from the security advisory text into JSON matching this exact schema:
+{"vulnerabilities": [{"cve_id": string or null, "affected_products": [{"vendor": string, "product": string, "version_range": string or null}], "cwe_category": string or null, "severity": "low"|"medium"|"high"|"critical", "attack_vector": "network"|"adjacent"|"local"|"physical"|"unknown", "impact_summary": string (max 400 chars), "remediation_action": string or null}]}
+
+CRITICAL: Only include a cve_id, vendor, product name, or version_range if that exact information is explicitly stated in the text. Never invent, guess, or infer specific identifiers, product names, or CVE numbers that are not literally present in the source text. If this information is not stated, use null (for cve_id, version_range) or omit the entry (for affected_products) rather than fabricating a plausible-sounding value.
+
+Return ONLY valid JSON, no markdown fences, no preamble."""
