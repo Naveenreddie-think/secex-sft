@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     github_token: str
+    hf_token: str
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
