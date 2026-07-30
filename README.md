@@ -18,7 +18,19 @@ Live demo
 
 
 
-Not yet deployed — currently runnable locally (see Running locally below). Deployment to Hugging Face Spaces + Render is in progress.
+\## Live demo
+
+
+
+\- \*\*Extraction tool\*\*: https://secex-frontend.onrender.com/extract.html
+
+\- \*\*Label review tool\*\*: https://secex-frontend.onrender.com/review.html
+
+\- \*\*Backend API\*\*: https://secex-sft.onrender.com
+
+
+
+Note: the backend is on Render's free tier and may take 30-60s to wake up if idle. Model inference runs on a Modal-hosted GPU endpoint and also has a cold-start delay (10-30s) after periods of inactivity — the first extraction after a lull will be slower than subsequent ones.
 
 
 
