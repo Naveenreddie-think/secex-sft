@@ -11,7 +11,7 @@ app = FastAPI(title="SecEx-SFT API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5500", "http://127.0.0.1:5500"],
+    allow_origins=["http://localhost:5500", "http://127.0.0.1:5500", "https://secex-frontend.onrender.com"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
