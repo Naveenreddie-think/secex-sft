@@ -130,3 +130,17 @@ This is a useful illustration of hallucination as a per-field problem, not a per
 Live testing surfaced a real gap in the groundedness check: it validated cve_id, product name, and version_range as structured fields, but did not check whether the same fabricated entity also appeared in the free-text impact_summary or remediation_action fields. In one case, the model fabricated a product name ("@microsoft/fast-api-authentication"), which was correctly caught and dropped from affected_products — but the same fabricated name still appeared, unflagged, in the remediation_action text. This meant the UI displayed a "details removed" notice while simultaneously showing that same unverified detail elsewhere on the page, which is arguably worse than no check at all since it implies the output was fully cleaned when it wasn't.
 
 Fixed by scanning free-text fields for any entity already identified as ungrounded from the structured-field check, and surfacing a warning if found. Chose to flag rather than auto-strip the substring from prose, since removing a mid-sentence phrase programmatically often produces broken grammar — transparency about the remaining issue was judged preferable to a silent, potentially malformed edit.
+
+
+## CVE ID Regression: Root Cause Identified
+
+The unexplained CVE ID accuracy regression (47.1%→42.1% ID, 33.3%→31.3% OOD) was investigated by categorizing every fine-tuned prediction into correct / missed (gold has a CVE, model predicted null) / hallucinated (gold is null, model invented one) / wrong (both non-null, different values).
+
+**id_test (n=19)**: 8 correct, 10 missed, 0 hallucinated, 1 wrong.
+**ood_test (n=16)**: 5 correct, 11 missed, 0 hallucinated, 0 wrong.
+
+Across both splits, the fine-tuned model's CVE ID errors are almost entirely (30 of 31 total errors) a single failure mode: **defaulting to null when a real CVE ID exists in the source text.** It essentially never fabricates or confuses CVE IDs.
+
+This confirms the training-data-imbalance hypothesis: only ~10% of the 200 training examples contained a real CVE ID (GHSA-native advisories frequently lack one). Fine-tuning strengthened the model's prior toward predicting null, trading recall on the minority case (real CVE present) for consistency — a precision/recall trade-off, not a hallucination problem, and notably the opposite failure mode from the free-text hallucination issues found elsewhere in this project.
+
+**This is a data problem, not a model or method problem.** The fix would be oversampling or upweighting the ~20 training examples containing a real CVE ID, not changing the training approach itself. Not implemented in this iteration given time constraints, but the mechanism is now understood and documented rather than left as an open question.
