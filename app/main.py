@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -7,22 +9,28 @@ from app.db import engine, Base, get_db
 from app.config import settings
 from app.routers import review, extract
 
-app = FastAPI(title="SecEx-SFT API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
+app = FastAPI(title="SecEx-SFT API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5500", "http://127.0.0.1:5500", "https://secex-frontend.onrender.com"],
+    allow_origins=[
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "https://secex-frontend.onrender.com",
+    ],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 app.include_router(review.router)
 app.include_router(extract.router)
-
-
-@app.on_event("startup")
-def on_startup():
-    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health")
