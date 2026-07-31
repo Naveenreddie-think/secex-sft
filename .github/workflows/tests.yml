@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: secex
+          POSTGRES_PASSWORD: secex_test_password
+          POSTGRES_DB: secex_test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        run: pip install -r requirements-backend.txt
+
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+psycopg2://secex:secex_test_password@localhost:5432/secex_test_db
+          APP_ENV: test
+          LOG_LEVEL: INFO
+          GITHUB_TOKEN: dummy_not_used_in_tests
+          HF_TOKEN: dummy_not_used_in_tests
+        run: pytest tests/ -v
