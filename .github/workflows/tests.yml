@@ -37,7 +37,7 @@ jobs:
         run: pip install -r requirements-backend.txt
 
       - name: Install test dependencies
-        run: pip install pytest
+        run: pip install pytest httpx
 
       - name: Run tests
         env:
