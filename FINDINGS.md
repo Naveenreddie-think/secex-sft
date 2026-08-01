@@ -114,3 +114,29 @@ While building DPO preference pairs, inspection of a low-signal pilot example (G
 
 \*\*Implication\*\*: the SFT training data itself teaches the model, in some fraction of examples, to produce specific product/version details that are not grounded in the text it's given — because the correct target label wasn't grounded in that text either. This is a plausible structural contributor to the hallucination behavior documented in Section 7, distinct from the model simply "making things up" — in these cases, the model may be doing exactly what training rewarded it for doing. Not fixed in this iteration; noted as a limitation of the dataset-construction methodology, and a factor to account for when interpreting groundedness-check failures (a failure may reflect an ungroundable label design, not necessarily a model reasoning error).
 
+\## Part 2: Preference Alignment (DPO)
+
+
+
+\### Preference Dataset Construction
+
+
+
+Built via self-play: sampled 6 candidate extractions per training-set advisory (temperature=0.8, from the SFT base+adapter, not the merged model — matching what DPO actually continues training from) and used the existing groundedness checker as an automated labeler rather than an LLM judge, per the original project plan. "Chosen" = fewest groundedness warnings (with a quality floor requiring ≤2), "rejected" = most warnings, among the 6 candidates per advisory.
+
+
+
+Result: 124 usable pairs from 146 training advisories (85% yield), zero invalid-JSON candidates across 876 total generations. 22 advisories were skipped either because all 6 candidates were equally (un)grounded, or because no candidate met the quality floor.
+
+
+
+\*\*Rejection reason distribution\*\*: product\_name (185 instances), cve\_id (98), version\_range (41), free\_text\_leakage (2). The preference data is well-distributed across the three main structured-field groundedness dimensions, but contains very little signal for the free-text-leakage failure mode discovered in Project A's live testing — that check only fires under a narrower condition (a structured field already flagged, and the same entity also appearing in prose), which is mechanically rarer than a structured field being wrong in isolation. \*\*DPO trained on this dataset should be expected to improve structured-field grounding, but is unlikely to meaningfully improve the free-text-leakage behavior specifically\*\* — noted as a known limitation of this preference dataset rather than a gap to silently ignore.
+
+
+
+\### A Structural Finding: Not All Hallucination Is a Model Error
+
+
+
+Inspecting a low-signal pilot case (GHSA-qh5g-q395-cx4j) revealed that its SFT gold label's `affected\_products` (10 specific package variants) do not appear anywhere in the corresponding advisory text (a single sentence with no product names at all) — because that field was populated from GHSA's structured metadata API, independent of the free-text description used as model input. This means some fraction of the original SFT training data itself taught the model to produce ungroundable specifics as the "correct" answer. When the model reproduces this pattern on similarly sparse inputs, it may be behaving exactly as trained, not malfunctioning — a structural property of the dataset-construction methodology, not purely a model-hallucination problem.
+
