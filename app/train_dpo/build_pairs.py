@@ -87,9 +87,9 @@ def main():
         pairs.append({
             "source_ghsa_id": item["source_ghsa_id"],
             "input_text": item["input_text"],
-            "chosen": best["raw"],
+            "chosen": json.dumps(best["parsed"]),  # groundedness-corrected, not raw
             "chosen_warning_count": best["warning_count"],
-            "rejected": worst["raw"],
+            "rejected": worst["raw"],  # the actual flawed completion, unmodified
             "rejected_warning_count": worst["warning_count"],
             "rejected_warnings": worst.get("warnings", []),
         })
