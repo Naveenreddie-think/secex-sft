@@ -6,3 +6,4 @@ data/raw/
 .pytest_cache/
 unsloth_compiled_cache/
 checkpoints/
+data/preference/*_candidates.json
